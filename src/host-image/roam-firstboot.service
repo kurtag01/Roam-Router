@@ -1,0 +1,13 @@
+[Unit]
+Description=Roam first start (install the router and apps bundled in this image)
+After=local-fs.target systemd-modules-load.service cloud-config.service
+ConditionPathExists=!/opt/roam-setup/done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/roam-setup/firstboot.sh
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+#!/bin/sh
+# Roam: link the Plex Media Server on the Roam host to the owner's Plex account.
+#   plex-claim claim-XXXXXXXX     (code from https://plex.tv/claim, valid for 4 minutes)
+# Plex accepts the claim from its own local network, so the router can do it.
+# Prints JSON: {"ok":true} or {"ok":false,"error":"..."}
+
+IP=$(uci -q get roam.main.host_ip); IP=${IP:-192.168.8.2}
+code=$(echo "$1" | tr -d ' \t\r\n')
+fail() { printf '{"ok":false,"error":"%s"}\n' "$1"; exit 0; }
+
+echo "$code" | grep -qE '^claim-[A-Za-z0-9_-]{10,64}$' || fail 'That is not a claim code. It starts with claim- and comes from plex.tv/claim.'
+uclient-fetch -q -T 5 -O /tmp/plex-id.$$ "http://$IP:32400/identity" >/dev/null 2>&1 || fail 'Plex is not answering on the Pi. Wait until it shows Running, then try again.'
+if grep -q 'claimed="1"' /tmp/plex-id.$$; then rm -f /tmp/plex-id.$$; fail 'This Plex server is already linked to an account.'; fi
+rm -f /tmp/plex-id.$$
+
+if ! uclient-fetch -q -T 30 -O /dev/null --post-data= "http://$IP:32400/myplex/claim?token=$code" >/dev/null 2>&1; then
+	fail 'Plex did not accept the code. Codes expire after 4 minutes: get a new one at plex.tv/claim and try again.'
+fi
+# The server re-registers with plex.tv; give it a moment to report claimed="1".
+for i in 1 2 3 4 5 6 7 8 9 10; do
+	uclient-fetch -q -T 5 -O - "http://$IP:32400/identity" 2>/dev/null | grep -q 'claimed="1"' && { logger -t roam "Plex server linked to a Plex account"; echo '{"ok":true}'; exit 0; }
+	sleep 2
+done
+fail 'Plex accepted the code but does not report itself as linked yet. Reload this page in a minute.'

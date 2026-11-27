@@ -1,0 +1,29 @@
+#!/bin/sh
+# Roam: make a changed Wi-Fi MAC address take effect.
+# hostapd reloads a running network in place, which keeps the old address, so once
+# LuCI has committed the new value we restart that radio.
+#   mac-apply <wifi-iface section> <new value: '' | random | aa:bb:cc:dd:ee:ff>
+
+sid="$1"; want="$2"
+case "$sid" in *[!A-Za-z0-9_]*|'') exit 1 ;; esac
+case "$want" in ''|random) ;; *) echo "$want" | grep -qiE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' || exit 1 ;; esac
+
+(
+	# Wait (max 90 s) until the value is committed to /etc/config (ignoring unsaved deltas).
+	i=0
+	while [ $i -lt 90 ]; do
+		cur=$(uci -q -t /var/run/roam-nodelta get "wireless.$sid.macaddr")
+		[ "$cur" = "$want" ] && break
+		sleep 1; i=$((i + 1))
+	done
+	[ $i -lt 90 ] || exit 0
+	sleep 3
+	radio=$(uci -q get "wireless.$sid.device")
+	[ -n "$radio" ] || exit 0
+	logger -t roam "applying new MAC for $sid: restarting $radio"
+	/sbin/wifi down "$radio"
+	sleep 1
+	/sbin/wifi up "$radio"
+) </dev/null >/dev/null 2>&1 &
+
+exit 0

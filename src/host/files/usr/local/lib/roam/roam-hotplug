@@ -1,0 +1,25 @@
+#!/bin/sh
+# Called (via udev + systemd-run) when a device appears on the host after the router
+# started: Wi-Fi radios and USB tethering adapters are moved into the router.
+#   roam-hotplug phy <phyname>
+#   roam-hotplug net <ifindex> <driver>
+pid=$(lxc-info -n roam -pH 2>/dev/null)
+[ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null || exit 0
+
+case "$1" in
+phy)
+	command -v nmcli >/dev/null && nmcli radio wifi on 2>/dev/null
+	rfkill unblock all 2>/dev/null
+	iw phy "$2" set netns "$pid" && logger -t roam "moved new Wi-Fi $2 into the router"
+	;;
+net)
+	ifname=$(ip -o link | awk -F': ' -v i="$2" '$1 == i { sub(/@.*/, "", $2); print $2 }')
+	[ -n "$ifname" ] || exit 0
+	case "$3" in
+		ipheth) new=eth1 ;;     # iPhone (OpenWrt interface "tether_ios")
+		*)      new=usb0 ;;     # Android & others (interface "tether")
+	esac
+	ip link set dev "$ifname" netns "$pid" name "$new" && logger -t roam "moved USB tethering $ifname into the router as $new"
+	;;
+esac
+exit 0

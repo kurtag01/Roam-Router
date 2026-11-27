@@ -1,0 +1,9 @@
+[Unit]
+Description=Roam: watch for clock jumps (no battery clock on the Pi)
+
+[Timer]
+OnClockChange=yes
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

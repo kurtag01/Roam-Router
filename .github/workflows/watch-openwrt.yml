@@ -1,0 +1,69 @@
+# Weekly: is there a newer OpenWrt service release (e.g. 25.12.6 -> 25.12.7)?
+# If so, opens a pull request that bumps OPENWRT_VERSION and the Roam patch version,
+# and starts a build of it. A new major series (e.g. 26.x) only opens an issue: those
+# need real testing before switching.
+# Repository setting needed: Settings > Actions > General > "Allow GitHub Actions to
+# create and approve pull requests".
+name: Watch OpenWrt releases
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare with downloads.openwrt.org
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          . ./versions.env
+          SERIES=${OPENWRT_VERSION%.*}
+          ALL=$(curl -fsSL https://downloads.openwrt.org/releases/ | grep -oE 'href="[0-9]+\.[0-9]+\.[0-9]+/"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -uV)
+          LATEST=$(echo "$ALL" | grep "^${SERIES//./\\.}\." | tail -1)
+          NEWEST=$(echo "$ALL" | tail -1)
+          echo "pinned $OPENWRT_VERSION, newest in $SERIES: $LATEST, newest overall: $NEWEST"
+
+          if [ -n "$LATEST" ] && [ "$LATEST" != "$OPENWRT_VERSION" ] && [ "$(printf '%s\n%s\n' "$LATEST" "$OPENWRT_VERSION" | sort -V | tail -1)" = "$LATEST" ]; then
+            BR="openwrt-$LATEST"
+            if git ls-remote --exit-code --heads origin "$BR" >/dev/null; then
+              echo "branch $BR already exists"
+            else
+              IFS=. read -r MA MI PA <<< "$ROAM_VERSION"
+              NEXT="$MA.$MI.$((PA + 1))"
+              sed -i "s/^OPENWRT_VERSION=.*/OPENWRT_VERSION=$LATEST/; s/^ROAM_VERSION=.*/ROAM_VERSION=$NEXT/" versions.env
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git checkout -b "$BR"
+              git commit -am "OpenWrt $LATEST (Roam $NEXT)"
+              git push origin "$BR"
+              gh pr create --head "$BR" --title "OpenWrt $LATEST (Roam $NEXT)" --body "OpenWrt released **$LATEST** (service release: security and bug fixes). This bumps \`OPENWRT_VERSION\` and the Roam version to $NEXT.
+
+          Release notes: https://openwrt.org/releases/${SERIES}/notes-${LATEST}
+
+          Next: wait for the Build check, flash a test Pi, merge, then tag \`v$NEXT\` (see RELEASING.md)."
+              # PRs opened with this token do not trigger workflows; start the build explicitly.
+              gh workflow run build.yml --ref "$BR"
+            fi
+          fi
+
+          NEWSERIES=${NEWEST%.*}
+          if [ "$NEWSERIES" != "$SERIES" ] && [ "$(printf '%s\n%s\n' "$NEWSERIES" "$SERIES" | sort -V | tail -1)" = "$NEWSERIES" ]; then
+            T="OpenWrt $NEWSERIES is available (major upgrade)"
+            if [ -z "$(gh issue list --state open --search "in:title \"$T\"" --json number -q '.[].number')" ]; then
+              gh issue create --title "$T" --body "OpenWrt **$NEWEST** is out. Roam is on the $SERIES series ($OPENWRT_VERSION), which keeps getting fixes for a while.
+
+          Moving to $NEWSERIES needs testing first: build with \`OPENWRT_VERSION=$NEWEST\`, check that the Roam patches still apply (System log: \"roam: ... could not apply\" means they don't), and test an update from the current release with settings kept."
+            fi
+          fi

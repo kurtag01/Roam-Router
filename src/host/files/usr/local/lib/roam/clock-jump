@@ -1,0 +1,26 @@
+#!/bin/sh
+# Roam: restart RomM after the wall clock jumps (the Pi has no battery clock, so it
+# boots with an old time and jumps once the router's uplink gives it NTP). Valkey
+# expires keys by wall-clock time, so a jump wipes RomM's job-worker registrations;
+# the workers then heartbeat back half-records that list no queues, and RomM says
+# "No scan worker is listening". A restart makes them register again.
+# Run at boot (records a baseline) and by roam-clock-jump.timer on every clock change.
+# Waits for RomM to finish starting before restarting it (see below).
+S=/run/roam-clock-offset
+off=$(( $(date +%s) - $(cut -d. -f1 /proc/uptime) ))   # wall clock minus time since boot
+old=$(cat $S 2>/dev/null); echo $off > $S
+[ -n "$old" ] || exit 0
+d=$(( off - old )); [ ${d#-} -gt 60 ] || exit 0
+c=roam-apps-romm-1
+[ "$(docker inspect -f '{{.State.Running}}' $c 2>/dev/null)" = true ] || exit 0
+# Never restart RomM while it is still starting: on first boot it builds its database
+# then, and an interrupted build leaves it unable to start ("Duplicate key"). Its
+# workers register only after that, so a jump during startup is harmless; wait until
+# the web page answers (up to 20 minutes), then restart.
+ip=$(sed -n 's/^HOST_IP=//p' /opt/roam-apps/.env 2>/dev/null); ip=${ip:-192.168.8.2}
+for i in $(seq 1 240); do
+	[ "$(curl -s -o /dev/null -m 4 -w '%{http_code}' "http://$ip/")" = 200 ] && break
+	sleep 5
+done
+logger -t roam "clock moved ${d}s; restarting RomM so its job workers register again"
+docker restart $c >/dev/null

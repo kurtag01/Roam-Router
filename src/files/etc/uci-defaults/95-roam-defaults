@@ -1,0 +1,186 @@
+#!/bin/sh
+# Roam travel-router defaults. Runs once on first boot (and after a factory reset).
+
+. /lib/functions.sh
+
+# ---- Theme --------------------------------------------------------------------
+uci -q batch <<'EOF'
+set luci.themes.Roam=/luci-static/roam
+set luci.main.mediaurlbase=/luci-static/roam
+commit luci
+EOF
+
+# ---- Hostname -----------------------------------------------------------------
+if [ "$(uci -q get system.@system[0].hostname)" = "OpenWrt" ]; then
+	uci set system.@system[0].hostname='Roam-Pi'
+	uci commit system
+fi
+
+# ---- Small state file for the UI ------------------------------------------------
+[ -f /etc/config/roam ] || {
+	touch /etc/config/roam
+	uci set roam.main=roam
+	uci set roam.main.wifi_done='0'
+	uci commit roam
+}
+
+# ---- Network ------------------------------------------------------------------
+# LAN on 192.168.8.1 so it does not clash with the 192.168.1.x networks most
+# hotels/homes use upstream.
+uci set network.lan.ipaddr='192.168.8.1'
+uci set network.lan.netmask='255.255.255.0'
+
+# Ethernet port: LAN by default. "wan" uses the same port and is disabled until the
+# UI switches the port to Internet (WAN) mode.
+uci -q get network.wan >/dev/null || {
+	uci set network.wan=interface
+	uci set network.wan.proto='dhcp'
+	uci set network.wan.device='eth0'
+	uci set network.wan.disabled='1'
+	uci set network.wan6=interface
+	uci set network.wan6.proto='dhcpv6'
+	uci set network.wan6.device='@wan'
+	uci set network.wan6.disabled='1'
+}
+
+# Repeater uplink (Wi-Fi client); the wifi-iface is created by roam-wifi.
+uci -q get network.wwan >/dev/null || {
+	uci set network.wwan=interface
+	uci set network.wwan.proto='dhcp'
+}
+
+# USB tethering: Android/most phones (usb0) and iPhone (ipheth shows up as eth1).
+uci -q get network.tether >/dev/null || {
+	uci set network.tether=interface
+	uci set network.tether.proto='dhcp'
+	uci set network.tether.device='usb0'
+	uci set network.tether_ios=interface
+	uci set network.tether_ios.proto='dhcp'
+	uci set network.tether_ios.device='eth1'
+}
+
+# Guest network (its Wi-Fi is off until enabled in the UI).
+uci -q get network.guest >/dev/null || {
+	uci set network.guest_dev=device
+	uci set network.guest_dev.type='bridge'
+	uci set network.guest_dev.name='br-guest'
+	uci set network.guest_dev.bridge_empty='1'
+	uci set network.guest=interface
+	uci set network.guest.proto='static'
+	uci set network.guest.device='br-guest'
+	uci set network.guest.ipaddr='192.168.9.1'
+	uci set network.guest.netmask='255.255.255.0'
+}
+
+# Privacy on upstream networks: see /usr/libexec/roam/dhcp-profile and /etc/init.d/roam-privacy.
+# Default profile: look like a Windows PC to device-fingerprinting routers (no hostname).
+uci commit network
+/usr/libexec/roam/dhcp-profile windows 0 noreload
+# Without a global DUID, DHCPv6 uses a MAC-based DUID instead of a fixed random one.
+uci -q delete network.globals.dhcp_default_duid
+uci commit network
+
+# NTP: generic pool (openwrt.pool.ntp.org lookups reveal the OS to the upstream network)
+uci -q delete system.ntp.server
+for i in 0 1 2 3; do uci add_list system.ntp.server="$i.pool.ntp.org"; done
+uci commit system
+
+# ---- DHCP ---------------------------------------------------------------------
+uci -q get dhcp.guest >/dev/null || {
+	uci set dhcp.guest=dhcp
+	uci set dhcp.guest.interface='guest'
+	uci set dhcp.guest.start='100'
+	uci set dhcp.guest.limit='150'
+	uci set dhcp.guest.leasetime='12h'
+}
+uci commit dhcp
+
+# ---- Firewall -----------------------------------------------------------------
+wanzone=""
+find_wan() { [ "$(uci -q get firewall.$1.name)" = "wan" ] && wanzone=$1; }
+config_load firewall
+config_foreach find_wan zone
+
+if [ -n "$wanzone" ]; then
+	for n in wan wan6 wwan tether tether_ios; do
+		uci show firewall.$wanzone.network 2>/dev/null | grep -q "'$n'" || uci add_list firewall.$wanzone.network="$n"
+	done
+fi
+
+uci -q get firewall.guest >/dev/null || {
+	uci set firewall.guest=zone
+	uci set firewall.guest.name='guest'
+	uci set firewall.guest.network='guest'
+	uci set firewall.guest.input='REJECT'
+	uci set firewall.guest.output='ACCEPT'
+	uci set firewall.guest.forward='REJECT'
+	uci set firewall.guest_wan=forwarding
+	uci set firewall.guest_wan.src='guest'
+	uci set firewall.guest_wan.dest='wan'
+	uci set firewall.guest_dhcp=rule
+	uci set firewall.guest_dhcp.name='Guest-DHCP'
+	uci set firewall.guest_dhcp.src='guest'
+	uci set firewall.guest_dhcp.proto='udp'
+	uci set firewall.guest_dhcp.dest_port='67-68'
+	uci set firewall.guest_dhcp.target='ACCEPT'
+	uci set firewall.guest_dns=rule
+	uci set firewall.guest_dns.name='Guest-DNS'
+	uci set firewall.guest_dns.src='guest'
+	uci set firewall.guest_dns.proto='tcp udp'
+	uci set firewall.guest_dns.dest_port='53'
+	uci set firewall.guest_dns.target='ACCEPT'
+}
+uci commit firewall
+
+# ---- Web UI: HTTPS available, but don't force the self-signed redirect ------------
+if uci -q get uhttpd.main >/dev/null; then
+	uci set uhttpd.main.redirect_https='0'
+	uci commit uhttpd
+fi
+
+/etc/init.d/roam-wifi enable
+
+# Encrypted DNS is installed but starts OFF (hotel sign-in pages need the network's DNS).
+if [ -x /etc/init.d/https-dns-proxy ]; then
+	/etc/init.d/https-dns-proxy disable
+	uci -q set https-dns-proxy.config.heartbeat_domain='-'
+	uci commit https-dns-proxy
+	uci set roam.main.doh='off'
+	uci commit roam
+fi
+/etc/init.d/roam-privacy enable
+/etc/init.d/roam-privacy start
+
+# ---- Browser caches ----------------------------------------------------------------
+# LuCI versions its page scripts with the package database's timestamp, which a Roam
+# update does not change; bump it so browsers load this build's pages, not cached ones.
+touch /lib/apk/db/installed 2>/dev/null
+
+# ---- Updates (Roam GitHub releases, see /usr/libexec/roam/update) ----------------
+uci -q get roam.update >/dev/null || {
+	uci set roam.update=update
+	uci set roam.update.auto='1'
+	uci commit roam
+}
+# Daily check at a random time between 03:00 and 08:59 (spreads requests out).
+grep -q 'roam/update auto' /etc/crontabs/root 2>/dev/null || {
+	mkdir -p /etc/crontabs
+	awk 'BEGIN { srand(); printf "%d %d * * * /usr/libexec/roam/update auto\n", int(rand() * 60), 3 + int(rand() * 6) }' >> /etc/crontabs/root
+}
+/etc/init.d/cron enable
+/etc/init.d/roam-update enable
+
+# ---- First-run admin password ----------------------------------------------------
+# OpenWrt ships root without a password, which lets anyone sign in (or SSH in) until
+# one is set. Give root a random password nobody knows instead; the sign-in page asks
+# the owner to choose the real one while root still has exactly this hash
+# (themes/roam/sysauth.ut).
+if [ -z "$(sed -n 's/^root:\([^:]*\):.*/\1/p' /etc/shadow)" ]; then
+	pw=$(head -c 32 /dev/urandom | md5sum | cut -d' ' -f1)
+	printf '%s\n%s\n' "$pw" "$pw" | passwd root >/dev/null 2>&1
+	unset pw
+	( umask 077; sed -n 's/^root:\([^:]*\):.*/\1/p' /etc/shadow > /etc/roam-setup-pending )
+	[ -s /etc/roam-setup-pending ] || rm -f /etc/roam-setup-pending
+fi
+
+exit 0

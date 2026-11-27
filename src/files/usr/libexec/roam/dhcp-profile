@@ -1,0 +1,50 @@
+#!/bin/sh
+# Roam: how this router identifies itself to upstream networks (hotel/home/phone).
+#   dhcp-profile <windows|minimal> <sendhost 0|1> [noreload]
+#
+# windows  DHCP request looks exactly like a Windows 10/11 PC: same option request list
+#          (option 55), vendor class "MSFT 5.0", client ID from the MAC address, and
+#          TTL 128. Device-fingerprinting routers then list it as a Windows computer.
+# minimal  Sends as little as possible (no vendor class, no client ID), but BusyBox's
+#          request list is recognizable as OpenWrt/Linux.
+# sendhost 1 also sends the router's hostname (off by default).
+
+profile="$1"; sendhost="$2"
+case "$profile" in windows|minimal) ;; *) echo "usage: $0 windows|minimal 0|1 [noreload]" >&2; exit 1 ;; esac
+case "$sendhost" in 0|1) ;; *) sendhost=0 ;; esac
+
+WIN_REQOPTS='1 3 6 15 31 33 43 44 46 47 119 121 249 252'
+
+for n in wan wwan tether tether_ios; do
+	uci -q get network.$n >/dev/null || continue
+	if [ "$sendhost" = 1 ]; then uci -q delete network.$n.hostname; else uci set network.$n.hostname='*'; fi
+	if [ "$profile" = windows ]; then
+		uci set network.$n.defaultreqopts='0'
+		uci set network.$n.reqopts="$WIN_REQOPTS"
+		uci set network.$n.vendorid='MSFT 5.0'
+		uci -q delete network.$n.novendorid
+		uci set network.$n.sendclientid='hardware'
+	else
+		uci -q delete network.$n.defaultreqopts
+		uci -q delete network.$n.reqopts
+		uci -q delete network.$n.vendorid
+		uci set network.$n.novendorid='1'
+		uci set network.$n.sendclientid='none'
+	fi
+done
+uci commit network
+
+if [ "$profile" = windows ]; then
+	printf 'net.ipv4.ip_default_ttl=128\nnet.ipv6.conf.default.hop_limit=128\nnet.ipv6.conf.all.hop_limit=128\n' > /etc/sysctl.d/90-roam-ttl.conf
+	sysctl -q -w net.ipv4.ip_default_ttl=128 net.ipv6.conf.default.hop_limit=128 net.ipv6.conf.all.hop_limit=128 2>/dev/null
+else
+	rm -f /etc/sysctl.d/90-roam-ttl.conf
+	sysctl -q -w net.ipv4.ip_default_ttl=64 net.ipv6.conf.default.hop_limit=64 net.ipv6.conf.all.hop_limit=64 2>/dev/null
+fi
+
+uci set roam.main.dhcp_profile="$profile"
+uci set roam.main.sendhost="$sendhost"
+uci commit roam
+
+[ "$3" = noreload ] || /sbin/reload_config >/dev/null 2>&1
+echo "$profile $sendhost"

@@ -1,0 +1,125 @@
+{
+ "luci-app-roam": {
+  "description": "Roam simplified travel-router pages",
+  "read": {
+   "ubus": {
+    "luci-rpc": [
+     "getHostHints",
+     "getDHCPLeases",
+     "getNetworkDevices",
+     "getWirelessDevices",
+     "getBoardJSON"
+    ],
+    "iwinfo": [
+     "info",
+     "scan",
+     "assoclist",
+     "devices",
+     "countrylist",
+     "freqlist",
+     "txpowerlist"
+    ],
+    "network.interface": [
+     "dump"
+    ],
+    "network.device": [
+     "status"
+    ],
+    "network.wireless": [
+     "status"
+    ],
+    "system": [
+     "board",
+     "info"
+    ],
+    "luci": [
+     "getTimezones",
+     "getUSBDevices",
+     "getUnixtime"
+    ],
+    "luci.wireguard": [
+     "getWgInstances"
+    ],
+    "file": [
+     "read",
+     "list"
+    ],
+    "rc": [
+     "list"
+    ]
+   },
+   "file": {
+    "/etc/roam/*": [
+     "read"
+    ]
+   },
+   "uci": [
+    "network",
+    "wireless",
+    "firewall",
+    "dhcp",
+    "system",
+    "luci",
+    "roam",
+    "https-dns-proxy"
+   ]
+  },
+  "write": {
+   "ubus": {
+    "luci": [
+     "setPassword",
+     "setLocaltime"
+    ],
+    "system": [
+     "reboot"
+    ],
+    "network.interface": [
+     "up",
+     "down"
+    ],
+    "network": [
+     "reload"
+    ],
+    "file": [
+     "exec"
+    ],
+    "hostapd.*": [
+     "del_client"
+    ]
+   },
+   "file": {
+    "/usr/libexec/roam/mac-apply": [
+     "exec"
+    ],
+    "/usr/libexec/roam/doh-set": [
+     "exec"
+    ],
+    "/usr/libexec/roam/killswitch": [
+     "exec"
+    ],
+    "/usr/libexec/roam/dhcp-profile": [
+     "exec"
+    ],
+    "/usr/libexec/roam/app-status": [
+     "exec"
+    ],
+    "/usr/libexec/roam/plex-claim": [
+     "exec"
+    ],
+    "/usr/libexec/roam/update": [
+     "exec"
+    ]
+   },
+   "uci": [
+    "network",
+    "wireless",
+    "firewall",
+    "dhcp",
+    "system",
+    "luci",
+    "roam",
+    "https-dns-proxy"
+   ]
+  }
+ }
+}

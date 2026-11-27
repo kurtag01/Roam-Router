@@ -1,0 +1,236 @@
+{#
+ Roam theme sign-in page: plain HTML forms (they work without JavaScript).
+
+ First run: until the owner chooses an admin password, this page asks for one
+ instead of signing in. First boot gives root a random password nobody knows and
+ stores its hash in /etc/roam-setup-pending (95-roam-defaults), so nobody can sign in
+ or SSH in before that. "Pending" only counts while root still has exactly that hash
+ (or no password at all), so a password set any other way ends the first-run mode.
+ The rules match /www/luci-static/roam/password.js and are checked here again.
+-#}
+
+{%
+	import { getuid, getspnam } from 'luci.core';
+	import { readfile, unlink } from 'fs';
+	import { openlog, syslog, closelog, LOG_NOTICE, LOG_AUTHPRIV } from 'log';
+	const PENDING = '/etc/roam-setup-pending';
+	const bi = ubus.call('system', 'board');
+	const sp = getspnam('root');
+	const pend = trim(readfile(PENDING) ?? '');
+	const setup = getuid() == 0 && sp != null && (sp.pwdp === '' || (pend != '' && sp.pwdp === pend));
+
+	const COMMON = [ 'password', 'passwort', 'qwerty', 'azerty', 'letmein', 'welcome', 'admin', 'openwrt',
+		'router', 'roam', 'iloveyou', 'monkey', 'dragon', 'sunshine', 'football', 'baseball', 'master',
+		'secret', 'changeme', 'default', 'abc123', '123456', 'trustno1' ];
+
+	function has_run(pw) {
+		const s = lc(pw);
+		for (let i = 0; i + 3 < length(s); i++) {
+			const d = ord(s, i + 1) - ord(s, i);
+			if (d < -1 || d > 1) continue;
+			if (ord(s, i + 2) - ord(s, i + 1) == d && ord(s, i + 3) - ord(s, i + 2) == d) return true;
+		}
+		return false;
+	}
+
+	function common_word(pw) {
+		let s = lc(pw);
+		const raw = s;
+		for (let p in [ [ /0/g, 'o' ], [ /[1!|]/g, 'i' ], [ /3/g, 'e' ], [ /[4@]/g, 'a' ], [ /[5$]/g, 's' ], [ /7/g, 't' ] ])
+			s = replace(s, p[0], p[1]);
+		for (let w in COMMON)
+			if (index(s, w) >= 0 || index(raw, w) >= 0) return w;
+		return null;
+	}
+
+	/* null if acceptable, else the reason */
+	function weakness(pw, strict) {
+		if (length(pw) == 0) return 'Enter a password.';
+		if (!strict) return null;
+		const kinds = (match(pw, /[a-z]/) ? 1 : 0) + (match(pw, /[A-Z]/) ? 1 : 0) + (match(pw, /[0-9]/) ? 1 : 0) + (match(pw, /[^A-Za-z0-9]/) ? 1 : 0);
+		if (length(pw) < 14) return 'Use at least 14 characters.';
+		if (kinds < 3 && length(pw) < 20) return 'Mix at least 3 of: lower case, upper case, numbers, symbols (or use 20+ characters).';
+		if (has_run(pw)) return 'Avoid repeats or sequences like aaaa, 1234 or abcd.';
+		const w = common_word(pw);
+		if (w) return `Avoid common words (it contains "${w}").`;
+		return null;
+	}
+
+	/* The form must come from this router's own page: blocks other websites (which
+	   could otherwise post a password here first) and DNS-rebinding host names. */
+	function same_origin() {
+		const host = lc(http.getenv('HTTP_HOST') ?? '');
+		const name = replace(host, /:[0-9]+$/, '');
+		const known = match(name, /^[0-9.]+$/) || match(name, /^\[[0-9a-f:.]+\]$/) || match(name, /\.lan$/) ||
+			name == 'localhost' || name == lc(bi?.hostname ?? '');
+		if (!known) return false;
+		const origin = lc(http.getenv('HTTP_ORIGIN') ?? '');
+		if (origin != '' && origin != 'null') return replace(origin, /^https?:\/\//, '') == host;
+		const ref = lc(http.getenv('HTTP_REFERER') ?? '');
+		return ref != '' && split(replace(ref, /^https?:\/\//, ''), '/')[0] == host;
+	}
+
+	let err = null, done = false, saved = false;
+	const strict_pref = uci.get('roam', 'main', 'strong_password') != '0';
+	let strict = strict_pref;
+
+	if (setup && http.getenv('REQUEST_METHOD') == 'POST' && http.formvalue('roam_setup') == '1') {
+		const pw1 = http.formvalue('roam_pw1') ?? '', pw2 = http.formvalue('roam_pw2') ?? '';
+		strict = http.formvalue('roam_strict') == '1';
+
+		if (!same_origin())
+			err = 'This request did not come from this page. Reload it and try again.';
+		else if (pw1 !== pw2)
+			err = 'The two passwords do not match.';
+		else
+			err = weakness(pw1, strict);
+
+		if (!err) {
+			const r = ubus.call('luci', 'setPassword', { username: 'root', password: pw1 });
+			if (r?.result !== true) {
+				err = 'Setting the password failed. Please try again.';
+			}
+			else {
+				saved = true;
+				unlink(PENDING);
+				uci.set('roam', 'main', 'strong_password', strict ? '1' : '0');
+				uci.save('roam');
+				uci.commit('roam');
+				openlog('roam');
+				syslog(LOG_NOTICE|LOG_AUTHPRIV, `admin password set on first run from ${http.getenv('REMOTE_ADDR') ?? '?'}`);
+				closelog();
+
+				/* Sign straight in, the same way LuCI's dispatcher does. */
+				const t = uci.get('luci', 'sauth', 'sessiontime');
+				const l = ubus.call('session', 'login', { username: 'root', password: pw1, timeout: t ? +t : null });
+				if (type(l?.ubus_rpc_session) == 'string') {
+					ubus.call('session', 'set', { ubus_rpc_session: l.ubus_rpc_session, values: { token: dispatcher.randomid(16) } });
+					const https = http.getenv('HTTPS') == 'on';
+					http.header('Set-Cookie', `${https ? 'sysauth_https' : 'sysauth_http'}=${l.ubus_rpc_session}; path=${dispatcher.build_url()}; SameSite=strict; HttpOnly${https ? '; secure' : ''}`);
+					http.redirect(dispatcher.build_url('admin'));
+					done = true;
+				}
+			}
+		}
+	}
+	const show_setup = setup && !saved;
+%}
+
+{% if (!done): %}
+{% include('header', { blank_page: true }) %}
+
+<div id="roam-login">
+	{% if (show_setup): %}
+	<form method="post" class="roam-login-card roam-setup-card" id="roam-setup" autocomplete="off">
+		<img src="{{ media }}/logo.svg" alt="" width="56" height="56">
+		<h2>Welcome</h2>
+		<p class="roam-muted">Before you start, choose the admin password for <strong>{{ striptags(bi?.hostname ?? 'this router') }}</strong>. You will use it to sign in here and for SSH (user "root").</p>
+
+		{% if (err): %}
+		<div class="alert-message error" role="alert">{{ entityencode(err) }}</div>
+		{% endif %}
+
+		<input type="hidden" name="roam_setup" value="1">
+		<input type="hidden" name="username" value="root" autocomplete="username">
+
+		<label for="roam_pw1">New password</label>
+		<div class="roam-pw-row">
+			<input name="roam_pw1" id="roam_pw1" type="password" autocomplete="new-password" autofocus required spellcheck="false">
+			<button type="button" class="btn cbi-button roam-js-only" id="roam_show" aria-controls="roam_pw1 roam_pw2">Show</button>
+		</div>
+		<div class="roam-meter roam-js-only" aria-hidden="true"><span id="roam_meter_bar"></span></div>
+		<div class="roam-meter-label roam-js-only" id="roam_meter_label" aria-live="polite"></div>
+
+		<label for="roam_pw2">Confirm password</label>
+		<input name="roam_pw2" id="roam_pw2" type="password" autocomplete="new-password" required spellcheck="false">
+
+		<button type="button" class="btn cbi-button roam-suggest roam-js-only" id="roam_suggest">Suggest a strong password</button>
+		<div class="roam-suggestion" id="roam_suggestion" hidden>
+			<code id="roam_suggestion_text"></code>
+			<span class="roam-muted roam-small">Filled in above. Save it in your password manager before you continue.</span>
+		</div>
+
+		<label class="roam-switch">
+			<input type="checkbox" name="roam_strict" id="roam_strict" value="1" role="switch" {{ strict ? 'checked' : '' }}>
+			<span class="roam-switch-track" aria-hidden="true"></span>
+			<span>Require a strong password <span class="roam-muted roam-small">(recommended)</span></span>
+		</label>
+
+		<ul class="roam-rules" id="roam_rules">
+			<li>At least 14 characters</li>
+			<li>3 of: lower case, upper case, numbers, symbols (or 20+ characters)</li>
+			<li>No repeats or sequences like aaaa, 1234, abcd</li>
+			<li>No common words like "password" or "admin"</li>
+		</ul>
+		<p class="roam-muted roam-small roam-weak-note" id="roam_weak_note" {{ strict ? 'hidden' : '' }}>Any password is accepted. A short or simple one is easy to guess for anyone on your Wi-Fi.</p>
+
+		<button type="submit" class="btn cbi-button-positive important" id="roam_save">Set password and continue</button>
+	</form>
+	<script src="{{ media }}/password.js"></script>
+	<script>
+	(function () {
+		var $ = function (id) { return document.getElementById(id); };
+		var pw1 = $('roam_pw1'), pw2 = $('roam_pw2'), strict = $('roam_strict'), rules = $('roam_rules'), save = $('roam_save');
+		var LEVEL = [ '', 'weak', 'fair', 'strong', 'vstrong' ];
+		document.documentElement.classList.add('roam-js');
+
+		function update() {
+			var r = RoamPassword.check(pw1.value, strict.checked);
+			rules.hidden = !strict.checked;
+			$('roam_weak_note').hidden = strict.checked;
+			if (strict.checked)
+				rules.replaceChildren.apply(rules, r.rules.map(function (x) {
+					var li = document.createElement('li');
+					li.className = pw1.value ? (x.ok ? 'ok' : 'bad') : '';
+					li.textContent = x.text;
+					return li;
+				}));
+			$('roam_meter_bar').className = LEVEL[r.strength];
+			$('roam_meter_label').textContent = pw1.value ? 'Strength: ' + r.label : '';
+			var match = pw2.value === '' || pw2.value === pw1.value;
+			pw2.setCustomValidity(match ? '' : 'The passwords do not match.');
+			pw1.setCustomValidity(pw1.value && !r.ok ? (strict.checked ? 'This password does not meet the strong-password rules.' : '') : '');
+			save.disabled = !(r.ok && pw2.value === pw1.value);
+		}
+
+		[ pw1, pw2 ].forEach(function (el) { el.addEventListener('input', update); });
+		strict.addEventListener('change', update);
+		$('roam_show').addEventListener('click', function () {
+			var show = pw1.type == 'password';
+			pw1.type = pw2.type = show ? 'text' : 'password';
+			this.textContent = show ? 'Hide' : 'Show';
+		});
+		$('roam_suggest').addEventListener('click', function () {
+			var p = RoamPassword.generate();
+			pw1.value = pw2.value = p;
+			pw1.type = pw2.type = 'text';
+			$('roam_show').textContent = 'Hide';
+			$('roam_suggestion_text').textContent = p;
+			$('roam_suggestion').hidden = false;
+			update();
+		});
+		update();
+	})();
+	</script>
+	{% else %}
+	<form method="post" class="roam-login-card">
+		<img src="{{ media }}/logo.svg" alt="" width="56" height="56">
+		<h2>{{ striptags(bi?.hostname ?? 'Router') }}</h2>
+		<p class="roam-muted">Sign in to manage your travel router</p>
+
+		{% if (saved): %}
+		<div class="alert-message notice">Your password is set. Sign in with it now.</div>
+		{% elif (fuser): %}
+		<div class="alert-message error">{{ _('Invalid username and/or password! Please try again.') }}</div>
+		{% endif %}
+
+		<input type="hidden" name="luci_username" value="{{ entityencode(duser ?? 'root', true) }}">
+		<label for="luci_password">Admin password</label>
+		<input name="luci_password" id="luci_password" type="password" autocomplete="current-password" autofocus>
+		<button type="submit" class="btn cbi-button-positive important">{{ _('Log in') }}</button>
+	</form>
+	{% endif %}
+</div>
+
+{% include('footer', { blank_page: true }) %}
+{% endif %}

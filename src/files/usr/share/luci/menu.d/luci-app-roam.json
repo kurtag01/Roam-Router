@@ -1,0 +1,118 @@
+{
+ "admin/roam": {
+  "title": "Home",
+  "order": 1,
+  "action": {
+   "type": "firstchild"
+  },
+  "depends": {
+   "acl": [
+    "luci-app-roam"
+   ]
+  }
+ },
+ "admin/roam/dashboard": {
+  "title": "Dashboard",
+  "order": 1,
+  "action": {
+   "type": "view",
+   "path": "roam/dashboard"
+  },
+  "depends": {
+   "acl": [
+    "luci-app-roam"
+   ]
+  }
+ },
+ "admin/roam/internet": {
+  "title": "Internet",
+  "order": 2,
+  "action": {
+   "type": "view",
+   "path": "roam/internet"
+  },
+  "depends": {
+   "acl": [
+    "luci-app-roam"
+   ]
+  }
+ },
+ "admin/roam/wireless": {
+  "title": "Wireless",
+  "order": 3,
+  "action": {
+   "type": "view",
+   "path": "roam/wireless"
+  },
+  "depends": {
+   "acl": [
+    "luci-app-roam"
+   ]
+  }
+ },
+ "admin/roam/clients": {
+  "title": "Clients",
+  "order": 4,
+  "action": {
+   "type": "view",
+   "path": "roam/clients"
+  },
+  "depends": {
+   "acl": [
+    "luci-app-roam"
+   ]
+  }
+ },
+ "admin/roam/vpn": {
+  "title": "VPN",
+  "order": 5,
+  "action": {
+   "type": "view",
+   "path": "roam/vpn"
+  },
+  "depends": {
+   "acl": [
+    "luci-app-roam"
+   ]
+  }
+ },
+ "admin/roam/network": {
+  "title": "Network",
+  "order": 6,
+  "action": {
+   "type": "view",
+   "path": "roam/network"
+  },
+  "depends": {
+   "acl": [
+    "luci-app-roam"
+   ]
+  }
+ },
+ "admin/roam/system": {
+  "title": "System",
+  "order": 7,
+  "action": {
+   "type": "view",
+   "path": "roam/system"
+  },
+  "depends": {
+   "acl": [
+    "luci-app-roam"
+   ]
+  }
+ },
+ "admin/roam/update": {
+  "title": "Updates",
+  "order": 9,
+  "action": {
+   "type": "view",
+   "path": "roam/update"
+  },
+  "depends": {
+   "acl": [
+    "luci-app-roam"
+   ]
+  }
+ }
+}

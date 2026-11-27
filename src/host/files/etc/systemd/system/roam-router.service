@@ -1,0 +1,19 @@
+[Unit]
+Description=Roam router (OpenWrt container)
+After=network-pre.target systemd-modules-load.service
+Wants=network-pre.target
+Before=docker.service
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/bin/lxc-stop -n roam -k
+ExecStart=/usr/bin/lxc-start -n roam -F
+ExecStartPost=/usr/local/lib/roam/host-link up
+ExecStop=/usr/bin/lxc-stop -n roam -t 30
+ExecStopPost=/usr/local/lib/roam/host-link fallback
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

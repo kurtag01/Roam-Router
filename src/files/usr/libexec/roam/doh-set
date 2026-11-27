@@ -1,0 +1,56 @@
+#!/bin/sh
+# Roam: switch encrypted DNS (DNS-over-HTTPS via https-dns-proxy) on or off.
+#   doh-set off
+#   doh-set cloudflare|quad9|google|adguard|mullvad|mullvad-adblock
+#   doh-set custom <https://host/path> <bootstrap IPs, comma separated>
+# When on, dnsmasq forwards every lookup to the local proxy, which sends it encrypted
+# to the provider; https-dns-proxy restores the previous DNS settings when stopped.
+
+P=https-dns-proxy
+INIT=/etc/init.d/$P
+[ -x "$INIT" ] || { echo "https-dns-proxy is not installed" >&2; exit 1; }
+
+case "$1" in
+	off)
+		$INIT stop >/dev/null 2>&1
+		$INIT disable
+		uci set roam.main.doh='off'
+		uci commit roam
+		echo off
+		exit 0
+		;;
+	cloudflare)      url='https://cloudflare-dns.com/dns-query';         bs='1.1.1.1,1.0.0.1' ;;
+	quad9)           url='https://dns.quad9.net/dns-query';              bs='9.9.9.9,149.112.112.112' ;;
+	google)          url='https://dns.google/dns-query';                 bs='8.8.8.8,8.8.4.4' ;;
+	adguard)         url='https://dns.adguard-dns.com/dns-query';        bs='94.140.14.14,94.140.15.15' ;;
+	mullvad)         url='https://dns.mullvad.net/dns-query';            bs='194.242.2.2' ;;
+	mullvad-adblock) url='https://adblock.dns.mullvad.net/dns-query';    bs='194.242.2.3' ;;
+	custom)
+		url="$2"; bs="$3"
+		echo "$url" | grep -qE '^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/%-]*)?$' || { echo "invalid URL" >&2; exit 1; }
+		echo "$bs" | grep -qE '^[0-9A-Fa-f:.]+(,[0-9A-Fa-f:.]+)*$' || { echo "invalid bootstrap DNS" >&2; exit 1; }
+		;;
+	*) echo "usage: $0 off|cloudflare|quad9|google|adguard|mullvad|mullvad-adblock|custom URL BOOTSTRAP" >&2; exit 1 ;;
+esac
+
+# One proxy instance for the chosen provider.
+while uci -q delete "$P.@https-dns-proxy[0]"; do :; done
+s=$(uci add $P https-dns-proxy)
+uci set "$P.$s.resolver_url=$url"
+uci set "$P.$s.bootstrap_dns=$bs"
+uci set "$P.$s.listen_port=5053"
+# No third-party "is it working" lookups at startup.
+uci set "$P.config.heartbeat_domain=-"
+uci commit $P
+
+uci set roam.main.doh="$1"
+if [ "$1" = custom ]; then
+	uci set roam.main.doh_url="$url"
+	uci set roam.main.doh_bootstrap="$bs"
+fi
+uci commit roam
+
+$INIT enable
+$INIT restart >/dev/null 2>&1
+echo "on $1"
+exit 0

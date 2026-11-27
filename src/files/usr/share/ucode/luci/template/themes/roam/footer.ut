@@ -1,0 +1,14 @@
+		{% if (!blank_page): %}
+				</div>
+				<footer id="roam-foot">
+					<span>
+						<a href="{{ entityencode(version.disturl ?? '#', true) }}" target="_blank" rel="noreferrer">{{ version.distname }} {{ version.distversion }}</a>
+						&middot; {{ version.luciname }} {{ version.luciversion }}
+					</span>
+				</footer>
+			</div>
+		</div>
+		<script>L.require('menu-roam')</script>
+		{% endif %}
+	</body>
+</html>

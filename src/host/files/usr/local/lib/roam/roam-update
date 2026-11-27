@@ -1,0 +1,172 @@
+#!/bin/bash
+# Roam host updater: installs the newest signed Roam release (router container + host
+# files + app versions), keeps the router's settings, and rolls back if the new router
+# does not come up.
+#
+#   roam-update            update now (also started by roam-update.path when the
+#                          router's Updates page asks: /etc/roam-update-request)
+#   roam-update --check    only print the newest version
+#
+# Progress goes to /var/log/roam-update.log and, for the router's Updates page, to
+# /etc/roam-update-status inside the router container.
+set -uo pipefail
+
+C=/var/lib/lxc/roam
+REL=/etc/roam-host-release          # ROAM_VERSION, ROAM_REPO (from the installed bundle)
+PUB=/usr/local/lib/roam/release.pub
+CONF=/etc/roam/host.conf            # ETH, APPS; ROAM_UPDATE_BASE for testing
+W=/var/lib/roam-update              # downloads (not /tmp: may be a small tmpfs)
+LOG=/var/log/roam-update.log
+ROUTER=http://192.168.8.1/cgi-bin/luci/
+
+[[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
+# Run from a private copy: the update replaces this very file, and bash reads scripts
+# while running them.
+if [[ $0 != /run/roam-update.run ]]; then install -m 600 "$0" /run/roam-update.run && exec bash /run/roam-update.run "$@"; exit 1; fi   # /run is noexec
+# shellcheck disable=SC1090
+. "$REL" 2>/dev/null; . "$CONF" 2>/dev/null
+ETH=${ETH:-eth0}; APPS=${APPS:-1}; BASE=${ROAM_UPDATE_BASE:-}
+exec 9>/run/roam-update.lock; flock -n 9 || { echo "an update is already running" >&2; exit 1; }
+
+log() { echo "$(date '+%F %T') $*" | tee -a "$LOG" >&2; }
+status() {   # status <state> <message> [version]: for the router's Updates page
+	local m=${2//\\/\\\\}; m=${m//\"/\\\"}
+	[[ -d $C/rootfs/etc ]] && printf '{"state":"%s","message":"%s","version":"%s","time":%s}\n' "$1" "$m" "${3:-}" "$(date +%s)" > "$C/rootfs/etc/roam-update-status"
+	log "[$1] $2"
+}
+fail() { status failed "$1" "${LATEST:-}"; exit 1; }
+url() {   # url <file> [version]
+	if [[ -n $BASE ]]; then echo "${BASE%/}/$1"
+	elif [[ -n ${2:-} ]]; then echo "https://github.com/$ROAM_REPO/releases/download/v$2/$1"
+	else echo "https://github.com/$ROAM_REPO/releases/latest/download/$1"; fi
+}
+fetch() { curl -fsSL --retry 3 --connect-timeout 20 -o "$2" "$1"; }
+sum_ok() { [[ "$(sha256sum "$1" | cut -d' ' -f1)" == "$(awk -v n="$2" '$2 == n || $2 == "*"n { print $1 }' "$W/SHA256SUMS")" ]]; }
+# Verify a usign/signify signature with openssl (same Ed25519 key as the routers use).
+sig_ok() {   # sig_ok <file> <file.sig>
+	local pub sig
+	pub=$(sed -n 2p "$PUB" | base64 -d | od -An -v -tx1 | tr -d ' \n')
+	sig=$(sed -n 2p "$2" | base64 -d | od -An -v -tx1 | tr -d ' \n')
+	[[ ${#pub} == 84 && ${#sig} == 148 && ${pub:4:16} == "${sig:4:16}" ]] || return 1
+	printf '%b' "$(echo "302a300506032b6570032100${pub:20}" | sed 's/../\\x&/g')" > "$W/key.der"
+	printf '%b' "$(echo "${sig:20}" | sed 's/../\\x&/g')" > "$W/sig.raw"
+	openssl pkeyutl -verify -pubin -keyform DER -inkey "$W/key.der" -rawin -in "$1" -sigfile "$W/sig.raw" >/dev/null 2>&1
+}
+newer() { [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1) == "$1" ]]; }
+# Run a command in the router. systemd's PATH lacks /bin and /sbin, where OpenWrt keeps sh.
+ratt() { lxc-attach -n roam --clear-env --set-var PATH=/usr/sbin:/usr/bin:/sbin:/bin -- "$@"; }
+router_ok() {   # is the router container up and answering?
+	lxc-info -n roam -s 2>/dev/null | grep -q RUNNING || return 1
+	ratt ubus call system board >/dev/null 2>&1 || return 1
+	local c; c=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$ROUTER")
+	[[ $c == 200 || $c == 403 ]]
+}
+host_files() {   # copy the current bundle's host files into place (as install.sh does)
+	cp -r /opt/roam-setup/files/. /
+	sed -i "s/@ETH@/$ETH/g" /etc/NetworkManager/conf.d/90-roam.conf 2>/dev/null
+	sed "s/@ETH@/$ETH/" /usr/local/lib/roam/lxc.conf.in > "$C/config"
+	chmod 755 /usr/local/lib/roam/*; chmod 644 /usr/local/lib/roam/lxc.conf.in /usr/local/lib/roam/release.pub 2>/dev/null
+	systemctl daemon-reload
+}
+compose() { if docker compose version >/dev/null 2>&1; then docker compose "$@"; else docker-compose "$@"; fi; }
+
+[[ -n ${ROAM_VERSION:-} ]] || fail "This Pi has no Roam version information (installed before updates existed). Re-flash it with the newest image."
+[[ -n ${ROAM_REPO:-}$BASE ]] || fail "No update source is set on this Pi."
+[[ -s $PUB ]] || fail "This Pi has no Roam release key, so updates cannot be verified."
+mkdir -p "$W"; rm -f "$W"/*
+rm -f "$C/rootfs/etc/roam-update-request"
+
+# ---- 1. Find and verify the newest release (needs the Internet, i.e. the router) ----
+status downloading "Looking for the newest release"
+fetch "$(url SHA256SUMS)" "$W/SHA256SUMS" && fetch "$(url SHA256SUMS.sig)" "$W/SHA256SUMS.sig" &&
+	fetch "$(url roam-release.json)" "$W/roam-release.json" || fail "Could not reach the update server."
+sig_ok "$W/SHA256SUMS" "$W/SHA256SUMS.sig" || fail "The update is not signed with the Roam release key. Not installing it."
+sum_ok "$W/roam-release.json" roam-release.json || fail "The update information does not match its checksum."
+LATEST=$(sed -n 's/.*"version": *"\([0-9.]*\)".*/\1/p' "$W/roam-release.json")
+FILE=$(sed -n 's/.*"host": *"\([^"]*\)".*/\1/p' "$W/roam-release.json")
+[[ $LATEST =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && -n $FILE ]] || fail "The update information is incomplete."
+if [[ ${1:-} == --check ]]; then echo "$LATEST"; exit 0; fi
+newer "$LATEST" "$ROAM_VERSION" || { status done "Already up to date (Roam $ROAM_VERSION)." "$ROAM_VERSION"; exit 0; }
+[[ $FILE =~ ^[A-Za-z0-9._-]+$ ]] || fail "Unexpected file name in the update information."
+
+status downloading "Downloading Roam $LATEST" "$LATEST"
+fetch "$(url "$FILE" "$LATEST")" "$W/$FILE" || fail "Download failed. Nothing was changed."
+status verifying "Checking the download" "$LATEST"
+sum_ok "$W/$FILE" "$FILE" || fail "The download is damaged (checksum mismatch). Nothing was changed."
+NEW=/opt/roam-setup.new; rm -rf "$NEW"; mkdir -p "$NEW"
+tar -xzf "$W/$FILE" -C "$NEW" --strip-components=1 || fail "The download could not be unpacked. Nothing was changed."
+case "$(uname -m)" in aarch64) ARCH=arm64 ;; *) ARCH=x86 ;; esac
+[[ -f $NEW/roam-openwrt-$ARCH-rootfs.tar.gz && -f $NEW/install.sh ]] || fail "The release has no router for this Pi ($ARCH). Nothing was changed."
+
+# New app versions are downloaded now, while the Internet is still up.
+APPS_CHANGED=0
+if (( APPS )) && [[ -f /opt/roam-apps/compose.yml ]] && ! cmp -s "$NEW/apps/compose.yml" /opt/roam-apps/compose.yml; then
+	APPS_CHANGED=1
+	status downloading "Downloading new app versions" "$LATEST"
+	compose --project-directory /opt/roam-apps -f "$NEW/apps/compose.yml" pull -q >>"$LOG" 2>&1 ||
+		fail "Could not download the new app versions. Nothing was changed."
+fi
+
+# ---- 2. Save the router's settings (OpenWrt's own sysupgrade backup) ----
+status installing "Saving the router settings" "$LATEST"
+ratt /bin/sh -c 'sysupgrade -b /tmp/roam-settings.tgz >/dev/null 2>&1 && cat /tmp/roam-settings.tgz && rm -f /tmp/roam-settings.tgz' > "$W/settings.tgz"
+tar -tzf "$W/settings.tgz" >/dev/null 2>&1 && [[ -s $W/settings.tgz ]] || fail "Could not save the router settings. Nothing was changed."
+cp "$W/settings.tgz" "/var/lib/roam-settings-before-$LATEST.tgz"; chmod 600 "/var/lib/roam-settings-before-$LATEST.tgz"
+ls -t /var/lib/roam-settings-before-*.tgz 2>/dev/null | tail -n +4 | xargs -r rm -f   # keep the newest 3
+
+# ---- 3. Swap the router (Wi-Fi and Internet drop now) ----
+# From here on, any failure, including this script dying, puts the previous router and
+# host files back (rollback), so the Pi never stays without a working router.
+STOPPED=0 SWAPPED_ROOTFS=0 SWAPPED_SETUP=0 DONE=0
+rollback() {
+	trap - EXIT
+	log "rolling back: $1"
+	systemctl stop roam-router.service
+	if (( SWAPPED_ROOTFS )) && [[ -d $C/rootfs.prev ]]; then
+		rm -rf "$C/rootfs.failed"; [[ -d $C/rootfs ]] && mv "$C/rootfs" "$C/rootfs.failed"; mv "$C/rootfs.prev" "$C/rootfs"
+	fi
+	if (( SWAPPED_SETUP )) && [[ -d /opt/roam-setup.prev ]]; then
+		rm -rf /opt/roam-setup.failed; mv /opt/roam-setup /opt/roam-setup.failed; mv /opt/roam-setup.prev /opt/roam-setup
+		host_files
+	fi
+	systemctl start roam-router.service
+	for _ in $(seq 1 36); do sleep 5; router_ok && break; done
+	status rolledback "Roam $LATEST did not start, so the Pi went back to Roam $ROAM_VERSION. Your settings are unchanged." "$ROAM_VERSION"
+	exit 1
+}
+trap 'rc=$?; (( DONE || ! STOPPED )) || rollback "the update stopped unexpectedly (exit $rc)"' EXIT
+
+status restarting "Installing Roam $LATEST: the router restarts now (1 to 2 minutes)." "$LATEST"
+sleep 3   # let the Updates page see this message
+systemctl stop roam-router.service; STOPPED=1
+rm -rf "$C/rootfs.prev"; mv "$C/rootfs" "$C/rootfs.prev"; SWAPPED_ROOTFS=1
+mkdir -p "$C/rootfs"
+tar -xzf "$NEW/roam-openwrt-$ARCH-rootfs.tar.gz" -C "$C/rootfs" && tar -xzf "$W/settings.tgz" -C "$C/rootfs"
+ok=$?
+rm -rf /opt/roam-setup.prev
+if [[ -d /opt/roam-setup ]]; then mv /opt/roam-setup /opt/roam-setup.prev; SWAPPED_SETUP=1; fi
+mv "$NEW" /opt/roam-setup
+[[ -f /opt/roam-setup.prev/done ]] && touch /opt/roam-setup/done   # first-boot setup must not run again
+host_files
+status restarting "Starting the new router" "$LATEST"
+(( ok == 0 )) && systemctl start roam-router.service
+
+healthy=0
+if (( ok == 0 )); then
+	for _ in $(seq 1 36); do sleep 5; router_ok && { healthy=1; break; }; done
+fi
+
+(( healthy )) || rollback "the new router did not come up"
+DONE=1
+
+# ---- 4. Apps, version record ----
+cp /opt/roam-setup/release "$REL"; [[ -f /opt/roam-setup/release.pub ]] && cp /opt/roam-setup/release.pub "$PUB"
+if (( APPS_CHANGED )); then
+	status restarting "Router updated; restarting Games and Plex with their new versions" "$LATEST"
+	cp /opt/roam-setup/apps/compose.yml /opt/roam-apps/compose.yml
+	systemctl restart roam-apps.service || log "WARNING: apps did not restart (journalctl -u roam-apps)"
+fi
+systemctl restart roam-update.path 2>/dev/null
+status done "Updated to Roam $LATEST." "$LATEST"
+rm -f "$W/$FILE"
+exit 0

@@ -1,0 +1,9 @@
+[Unit]
+Description=Roam: watch for update requests from the router's Updates page
+
+[Path]
+PathExists=/var/lib/lxc/roam/rootfs/etc/roam-update-request
+Unit=roam-update.service
+
+[Install]
+WantedBy=multi-user.target

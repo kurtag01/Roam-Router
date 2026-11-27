@@ -1,0 +1,43 @@
+#!/bin/sh
+# Roam running as an LXC container on Raspberry Pi OS (the "Roam host").
+# The host moves in: eth0 (the Pi's Ethernet), all Wi-Fi radios, USB tethering devices,
+# and a veth link "lanhost" whose other end (on the host) is 192.168.8.2.
+
+. /lib/functions.sh
+
+uci set roam.main.container='1'
+uci set roam.main.host_ip='192.168.8.2'
+uci commit roam
+
+# LAN bridge: Ethernet port + link to the host OS.
+br=""
+find_br() { [ "$(uci -q get network.$1.name)" = "br-lan" ] && br=$1; }
+config_load network
+config_foreach find_br device
+if [ -z "$br" ]; then
+	br=$(uci add network device); uci set network.$br.name='br-lan'; uci set network.$br.type='bridge'
+fi
+uci -q delete network.$br.ports
+uci add_list network.$br.ports='eth0'
+uci add_list network.$br.ports='lanhost'
+uci set network.lan.device='br-lan'
+
+# Ethernet port: LAN by default; "wan" uses it only when switched to Internet mode.
+uci set network.wan.device='eth0'
+uci set network.wan.disabled='1'
+uci set network.wan6.device='@wan'
+uci set network.wan6.disabled='1'
+uci commit network
+
+# Names for the apps on the host.
+for n in games plex host; do
+	uci -q get dhcp.roam_$n >/dev/null && continue
+	uci set dhcp.roam_$n=domain
+	uci set dhcp.roam_$n.name="$n"
+	uci set dhcp.roam_$n.ip='192.168.8.2'
+done
+uci commit dhcp
+
+# The host keeps the clock (a container cannot set it).
+/etc/init.d/sysntpd disable 2>/dev/null
+exit 0

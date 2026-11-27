@@ -1,0 +1,13 @@
+[Unit]
+Description=Roam: restart RomM after a clock jump
+# The boot run records the baseline before any app starts.
+Before=docker.service
+
+[Service]
+Type=oneshot
+# clock-jump waits for RomM to finish starting before restarting it
+TimeoutStartSec=25min
+ExecStart=/usr/local/lib/roam/clock-jump
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,119 @@
+#!/bin/sh
+# Roam updater (router side). Updates come only from this project's GitHub releases,
+# never straight from OpenWrt, and only if they are signed with the Roam release key.
+#
+#   update check     check for a newer release -> JSON
+#   update cached    last check result (no network) -> JSON
+#   update apply     start installing the newest release (returns at once; see status)
+#                    standalone Pi: download, verify, sysupgrade (settings kept)
+#                    Roam host:     the host updates router + apps and rolls back on failure
+#   update status    progress of a running update -> JSON
+#   update auto      daily cron job: quiet check if roam.update.auto != 0
+#
+# Release files (see build.sh release): roam-release.json, SHA256SUMS, SHA256SUMS.sig,
+# and per target a firmware file listed in roam-release.json "files".
+# Testing: uci set roam.update.base_url=http://host:port/dir  (a folder with those files)
+
+. /etc/roam-release 2>/dev/null
+REPO=$(uci -q get roam.update.repo); REPO=${REPO:-$ROAM_REPO}
+BASE=$(uci -q get roam.update.base_url)
+PUB=/etc/roam/release.pub
+D=/tmp/roam-update
+HOST_STATUS=/etc/roam-update-status     # written by the Roam host (container target)
+HOST_REQUEST=/etc/roam-update-request   # read by the Roam host
+mkdir -p $D
+
+json_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\r\n'; }
+fail() { printf '{"error":"%s","current":"%s"}\n' "$(json_str "$1")" "$ROAM_VERSION"; exit 0; }
+# newer A B: is version A newer than B? (numeric x.y.z)
+newer() { awk -v a="$1" -v b="$2" 'BEGIN { split(a, x, "."); split(b, y, ".");
+	for (i = 1; i <= 3; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 } exit 1 }'; }
+url() {   # url <file> [version]
+	if [ -n "$BASE" ]; then echo "${BASE%/}/$1"
+	elif [ -n "$2" ]; then echo "https://github.com/$REPO/releases/download/v$2/$1"
+	else echo "https://github.com/$REPO/releases/latest/download/$1"; fi
+}
+fetch() { uclient-fetch -q -T 30 -O "$2" "$1" >/dev/null 2>&1; }
+sum_ok() {   # sum_ok <file> <name in SHA256SUMS>
+	want=$(awk -v n="$2" '$2 == n || $2 == "*"n { print $1 }' $D/SHA256SUMS)
+	[ -n "$want" ] && [ "$(sha256sum "$1" | cut -d' ' -f1)" = "$want" ]
+}
+status() {   # status <state> <message> [version]
+	printf '{"state":"%s","message":"%s","version":"%s","time":%s}\n' "$1" "$(json_str "$2")" "$3" "$(date +%s)" > $D/status.json
+}
+
+check() {
+	[ -n "$ROAM_VERSION" ] || fail "This firmware has no version information (built without build.sh)."
+	[ -n "$REPO$BASE" ] || fail "No update source is set for this firmware."
+	[ -s $PUB ] || fail "This firmware has no release key, so updates cannot be verified."
+	rm -f $D/SHA256SUMS $D/SHA256SUMS.sig $D/roam-release.json
+	fetch "$(url SHA256SUMS)" $D/SHA256SUMS && fetch "$(url SHA256SUMS.sig)" $D/SHA256SUMS.sig &&
+		fetch "$(url roam-release.json)" $D/roam-release.json ||
+		fail "Could not reach the update server. Check the Internet connection."
+	usign -V -q -m $D/SHA256SUMS -p $PUB -x $D/SHA256SUMS.sig 2>/dev/null ||
+		fail "The update information is not signed with the Roam release key. Not installing it."
+	sum_ok $D/roam-release.json roam-release.json || fail "The update information does not match its checksum."
+	LATEST=$(jsonfilter -i $D/roam-release.json -e '@.version')
+	OWRT=$(jsonfilter -i $D/roam-release.json -e '@.openwrt')
+	case "$ROAM_TARGET" in container) key=host ;; *) key=$ROAM_TARGET ;; esac
+	FILE=$(jsonfilter -i $D/roam-release.json -e "@.files['$key']")
+	echo "$LATEST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || fail "The update information has no valid version."
+	NEW=false; newer "$LATEST" "$ROAM_VERSION" && NEW=true
+	[ -n "$FILE" ] || { [ "$NEW" = true ] && fail "Release $LATEST has no file for this device ($ROAM_TARGET)."; }
+	NOTES="https://github.com/$REPO/releases/tag/v$LATEST"; [ -n "$BASE" ] && NOTES=""
+	printf '{"current":"%s","openwrt_current":"%s","latest":"%s","openwrt_latest":"%s","newer":%s,"target":"%s","file":"%s","notes":"%s","checked":%s}\n' \
+		"$ROAM_VERSION" "$OPENWRT_VERSION" "$LATEST" "$OWRT" "$NEW" "$ROAM_TARGET" "$(json_str "$FILE")" "$NOTES" "$(date +%s)" | tee $D/check.json
+}
+
+worker() {   # runs in the background (standalone targets)
+	status downloading "Downloading Roam $LATEST" "$LATEST"
+	rm -f $D/firmware.bin
+	if ! fetch "$(url "$FILE" "$LATEST")" $D/firmware.bin; then status failed "Download failed. Check the Internet connection and try again." "$LATEST"; return; fi
+	status verifying "Checking the download" "$LATEST"
+	if ! sum_ok $D/firmware.bin "$FILE"; then rm -f $D/firmware.bin; status failed "The download is damaged (checksum mismatch). Nothing was changed." "$LATEST"; return; fi
+	if ! sysupgrade -T $D/firmware.bin >/dev/null 2>&1; then rm -f $D/firmware.bin; status failed "This firmware does not fit this device. Nothing was changed." "$LATEST"; return; fi
+	status installing "Installing Roam $LATEST. The router restarts in about a minute; settings are kept." "$LATEST"
+	logger -t roam "updating to Roam $LATEST (OpenWrt $OWRT)"
+	sleep 3
+	sysupgrade $D/firmware.bin >/dev/null 2>&1 || status failed "The firmware could not be written. Nothing was changed." "$LATEST"
+}
+
+case "$1" in
+	check) check ;;
+	cached) [ -s $D/check.json ] && cat $D/check.json || printf '{"current":"%s","openwrt_current":"%s","target":"%s"}\n' "$ROAM_VERSION" "$OPENWRT_VERSION" "$ROAM_TARGET" ;;
+	auto)
+		[ "$(uci -q get roam.update.auto)" = 0 ] && exit 0
+		check >/dev/null ;;
+	apply)
+		( check ) > $D/apply.json
+		grep -q '"error"' $D/apply.json && { cat $D/apply.json; exit 0; }
+		LATEST=$(jsonfilter -i $D/apply.json -e '@.latest'); FILE=$(jsonfilter -i $D/apply.json -e '@.file')
+		OWRT=$(jsonfilter -i $D/apply.json -e '@.openwrt_latest')
+		[ "$(jsonfilter -i $D/apply.json -e '@.newer')" = true ] || fail "You already have the newest version ($ROAM_VERSION)."
+		case "$(jsonfilter -i $D/status.json -e '@.state' 2>/dev/null)" in
+			downloading|verifying|installing) fail "An update is already running." ;;
+		esac
+		if [ "$ROAM_TARGET" = container ]; then
+			rm -f $HOST_STATUS
+			echo "$LATEST" > $HOST_REQUEST
+			status requested "Asked the Roam host to install $LATEST" "$LATEST"
+		else
+			# Detach so the web request returns and the upgrade outlives rpcd.
+			status downloading "Starting" "$LATEST"
+			LATEST="$LATEST" FILE="$FILE" OWRT="$OWRT" setsid /usr/libexec/roam/update worker </dev/null >/dev/null 2>&1 &
+		fi
+		echo '{"started":true}' ;;
+	worker)   # started by apply in the background; LATEST/FILE/OWRT come from the environment
+		[ -s $D/SHA256SUMS ] && [ -n "$LATEST" ] && [ -n "$FILE" ] && worker ;;
+	status)
+		if [ "$ROAM_TARGET" = container ] && [ -s $HOST_STATUS ]; then cat $HOST_STATUS
+		elif [ -s $D/status.json ]; then
+			# A request the host never picked up (old host software or host down)
+			if [ "$ROAM_TARGET" = container ] && grep -q '"requested"' $D/status.json && [ -f $HOST_REQUEST ] &&
+				[ $(( $(date +%s) - $(jsonfilter -i $D/status.json -e '@.time') )) -gt 90 ]; then
+				status failed "The Roam host did not respond. Restart the Pi and try again." ""
+			fi
+			cat $D/status.json
+		else echo '{"state":"idle"}'; fi ;;
+	*) echo "usage: $0 check|cached|apply|status|auto" >&2; exit 1 ;;
+esac

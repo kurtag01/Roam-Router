@@ -1,0 +1,45 @@
+#!/bin/sh /etc/rc.common
+# Roam: small fixes to OpenWrt scripts, applied before wpad/netifd start (START=15) and
+# re-applied automatically if a package update replaces the patched file:
+#  - Wi-Fi: Random/Custom MAC addresses on full-MAC radios (the Pi's built-in Wi-Fi)
+#  - DHCP: a "novendorid" option so option 60 ("udhcp <version>") can be left out
+
+START=15
+
+start() {
+	fix_fullmac_mac
+	fix_dhcp_vendorid
+}
+
+# Full-MAC Wi-Fi chips (e.g. the Pi's built-in Broadcom/brcmfmac) reuse their existing
+# interface, and OpenWrt's NL80211_CMD_SET_INTERFACE ignores the requested MAC, so a
+# Random/Custom MAC never took effect. Also set it on the (still down) netdev.
+fix_fullmac_mac() {
+	local f=/usr/share/hostap/common.uc
+	[ -f "$f" ] || return 0
+	grep -q 'roam: apply MAC on reused' "$f" && return 0
+	sed -i 's|^\(\t\t\)nl80211.request(nl80211.const.NL80211_CMD_SET_INTERFACE, 0, req);$|&\n\1// roam: apply MAC on reused (full-MAC) interfaces; SET_INTERFACE ignores it\n\1if (data.macaddr) {\n\1\trtnl.request(rtnl.const.RTM_SETLINK, 0, { dev: name, change: 1, flags: 0 });\n\1\trtnl.request(rtnl.const.RTM_SETLINK, 0, { dev: name, address: data.macaddr });\n\1}|' "$f"
+	if grep -q 'roam: apply MAC on reused' "$f"; then
+		logger -t roam "Wi-Fi: MAC address fix for full-MAC radios applied"
+	else
+		logger -t roam "Wi-Fi: could not apply MAC address fix (script layout changed)"
+	fi
+}
+
+fix_dhcp_vendorid() {
+	local f=/lib/netifd/proto/dhcp.sh
+	[ -f "$f" ] || return 0
+	grep -q 'novendorid' "$f" && return 0
+
+	sed -i \
+		-e "s|^\(\s*\)proto_config_add_string vendorid$|&\n\1proto_config_add_boolean novendorid|" \
+		-e "s|^\(\s*\)json_get_vars ipaddr hostname .*$|&\n\1json_get_var novendorid novendorid|" \
+		-e "s|^\(\s*\)proto_export \"INTERFACE=\$config\"$|\1[ \"\$novendorid\" = 1 ] \&\& emptyvendorid=1\n&|" \
+		"$f"
+
+	if grep -q 'emptyvendorid=1$' "$f" && [ "$(grep -c novendorid "$f")" -ge 3 ]; then
+		logger -t roam "DHCP client: added novendorid option"
+	else
+		logger -t roam "DHCP client: could not add novendorid option (script layout changed)"
+	fi
+}

@@ -1,0 +1,26 @@
+#!/bin/sh
+# Roam host apps: are they answering? Prints JSON for the Dashboard / Apps page:
+#   {"host":true,"games":true,"plex":false,"plex_claimed":false,"setup":"<first-start progress text>"}
+# plex_claimed: the Plex server is linked to a Plex account (see plex-claim).
+# The host writes /etc/roam-host-setup (inside this container) while it is still
+# installing the apps after the first boot, and removes it when done.
+
+IP=$(uci -q get roam.main.host_ip); IP=${IP:-192.168.8.2}
+T=/tmp/roam-app-status.$$
+mkdir -p $T
+
+up() { uclient-fetch -q -T 4 -O /dev/null "$2" >/dev/null 2>&1 && echo true > $T/$1 || echo false > $T/$1; }
+up games "http://$IP/" &
+( uclient-fetch -q -T 4 -O $T/plexid "http://$IP:32400/identity" >/dev/null 2>&1 && echo true || echo false ) > $T/plex &
+( ping -c 1 -W 2 "$IP" >/dev/null 2>&1 && echo true || echo false ) > $T/host &
+wait
+
+host=$(cat $T/host); games=$(cat $T/games); plex=$(cat $T/plex)
+claimed=false; grep -q 'claimed="1"' $T/plexid 2>/dev/null && claimed=true
+# Answering apps prove the host is up even if ping is filtered.
+[ "$games" = true ] || [ "$plex" = true ] && host=true
+rm -rf $T
+
+setup=""
+[ -s /etc/roam-host-setup ] && setup=$(head -n 1 /etc/roam-host-setup | tr -d '"\\\r')
+printf '{"host":%s,"games":%s,"plex":%s,"plex_claimed":%s,"setup":"%s"}\n' "$host" "$games" "$plex" "$claimed" "$setup"

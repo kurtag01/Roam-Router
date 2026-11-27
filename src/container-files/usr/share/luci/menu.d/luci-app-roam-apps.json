@@ -1,0 +1,15 @@
+{
+ "admin/roam/apps": {
+  "title": "Apps",
+  "order": 5.5,
+  "action": {
+   "type": "view",
+   "path": "roam/apps"
+  },
+  "depends": {
+   "acl": [
+    "luci-app-roam"
+   ]
+  }
+ }
+}

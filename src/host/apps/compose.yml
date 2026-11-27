@@ -1,0 +1,58 @@
+# Roam apps (run on the Roam host next to the router container).
+# Reachable only from the router's own LAN: http://games.lan and http://plex.lan:32400/web
+# Image versions are pinned (tested together); Dependabot proposes updates.
+name: roam-apps
+
+services:
+  romm-db:
+    image: mariadb:11.8.9
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MARIADB_DATABASE: romm
+      MARIADB_USER: romm
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ${APPDATA}/romm-db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  romm:
+    image: rommapp/romm:5.4.1
+    restart: unless-stopped
+    depends_on:
+      romm-db:
+        condition: service_healthy
+    environment:
+      DB_HOST: romm-db
+      DB_NAME: romm
+      DB_USER: romm
+      DB_PASSWD: ${DB_PASSWORD}
+      ROMM_AUTH_SECRET_KEY: ${ROMM_SECRET}
+      TZ: ${TZ}
+    volumes:
+      - ${APPDATA}/romm/resources:/romm/resources
+      - ${APPDATA}/romm/redis:/redis-data
+      - ${APPDATA}/romm/config:/romm/config
+      - ${GAMES}/library:/romm/library
+      - ${GAMES}/assets:/romm/assets
+    ports:
+      - "${HOST_IP}:80:8080"
+
+  plex:
+    image: lscr.io/linuxserver/plex:1.43.5.11079-b3b13e506-ls334
+    restart: unless-stopped
+    # Host networking is what Plex expects; the host is only on the router's LAN.
+    network_mode: host
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      TZ: ${TZ}
+      VERSION: docker
+      PLEX_CLAIM: ${PLEX_CLAIM}
+    volumes:
+      - ${APPDATA}/plex:/config
+      - ${MEDIA}:/media

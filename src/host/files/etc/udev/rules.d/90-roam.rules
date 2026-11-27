@@ -1,0 +1,3 @@
+# Roam: hand hot-plugged Wi-Fi radios and USB tethering devices to the router container.
+SUBSYSTEM=="ieee80211", ACTION=="add", RUN+="/usr/bin/systemd-run --no-block --quiet /usr/local/lib/roam/roam-hotplug phy %k"
+SUBSYSTEM=="net", ACTION=="add", ENV{ID_NET_DRIVER}=="rndis_host|cdc_ether|cdc_ncm|ipheth", RUN+="/usr/bin/systemd-run --no-block --quiet /usr/local/lib/roam/roam-hotplug net $env{IFINDEX} $env{ID_NET_DRIVER}"

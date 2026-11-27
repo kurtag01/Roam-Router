@@ -1,0 +1,12 @@
+# Proposes updates for the pinned app images (RomM, MariaDB, Plex) and for the actions.
+# Each update arrives as a pull request; the Build workflow builds it, you test, then merge.
+version: 2
+updates:
+  - package-ecosystem: docker-compose
+    directory: /src/host/apps
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

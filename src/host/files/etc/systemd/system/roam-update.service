@@ -1,0 +1,10 @@
+[Unit]
+Description=Roam: install the newest signed Roam release (router + apps), with rollback
+After=roam-router.service docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/roam/roam-update
+# A request that fails must not re-trigger the path unit in a loop.
+ExecStopPost=/bin/rm -f /var/lib/lxc/roam/rootfs/etc/roam-update-request
+TimeoutStartSec=45min

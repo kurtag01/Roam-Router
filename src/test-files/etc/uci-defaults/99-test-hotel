@@ -1,0 +1,38 @@
+#!/bin/sh
+# TEST IMAGE ONLY: radio1 (simulated) pretends to be a hotel network "HotelWiFi"
+# (password hotelpass123) with its own DHCP server, so the Repeater can be tested.
+uci -q batch <<'B'
+set network.hotel=interface
+set network.hotel.proto='static'
+set network.hotel.ipaddr='10.99.0.1'
+set network.hotel.netmask='255.255.255.0'
+set dhcp.hotel=dhcp
+set dhcp.hotel.interface='hotel'
+set dhcp.hotel.start='50'
+set dhcp.hotel.limit='50'
+set firewall.hotel=zone
+set firewall.hotel.name='hotel'
+set firewall.hotel.network='hotel'
+set firewall.hotel.input='ACCEPT'
+set firewall.hotel.output='ACCEPT'
+set firewall.hotel.forward='REJECT'
+commit network
+commit dhcp
+commit firewall
+B
+# radio1 is created by "wifi config" before uci-defaults run
+uci -q batch <<'B'
+set wireless.radio1.band='5g'
+set wireless.radio1.channel='36'
+set wireless.radio1.country='US'
+set wireless.radio1.disabled='0'
+set wireless.hotel=wifi-iface
+set wireless.hotel.device='radio1'
+set wireless.hotel.mode='ap'
+set wireless.hotel.network='hotel'
+set wireless.hotel.ssid='HotelWiFi'
+set wireless.hotel.encryption='psk2'
+set wireless.hotel.key='hotelpass123'
+commit wireless
+B
+exit 0

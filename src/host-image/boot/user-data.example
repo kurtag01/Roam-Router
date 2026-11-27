@@ -1,0 +1,21 @@
+#cloud-config
+# Raspberry Pi OS first-boot settings (cloud-init) for the Roam host image.
+#
+# SSH access to the Pi (optional; the router, games and Plex work without it):
+# before the FIRST boot, open this file on the SD card's boot partition (any PC can read
+# it) and replace [] below with your public key in quotes, e.g.
+#     ssh_authorized_keys: [ "ssh-ed25519 AAAAC3Nz... you@laptop" ]
+# Then connect with:  ssh roam@192.168.8.2
+hostname: roam-host
+manage_etc_hosts: true
+users:
+  - name: roam
+    groups: users,adm,dialout,audio,netdev,video,plugdev,cdrom,games,input,gpio,spi,i2c,render,sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys: []
+enable_ssh: true
+ssh_pwauth: false
+runcmd:
+  - [ systemctl, enable, --now, ssh ]

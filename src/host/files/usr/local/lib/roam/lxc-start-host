@@ -1,0 +1,12 @@
+#!/bin/sh
+# LXC start-host hook: runs on the host right before the router's init starts.
+# Moves every Wi-Fi radio into the router container (LXC_PID = its init process).
+# Pi OS keeps Wi-Fi soft-blocked (NetworkManager's switch) until a country is set;
+# the router manages Wi-Fi itself, so switch it on for good.
+command -v nmcli >/dev/null && nmcli radio wifi on 2>/dev/null
+rfkill unblock all 2>/dev/null
+for p in /sys/class/ieee80211/*; do
+	[ -e "$p" ] || continue
+	iw phy "$(basename "$p")" set netns "$LXC_PID" && logger -t roam "moved Wi-Fi $(basename "$p") into the router"
+done
+exit 0

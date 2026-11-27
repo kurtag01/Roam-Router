@@ -1,0 +1,12 @@
+# Private: router settings backups (VPN keys, passwords) and the release signing key
+/backups/
+*.sec
+# Your own cloud-init settings (SSH key) and image options; the template is user-data.example
+/src/host-image/boot/user-data
+/src/host-image/boot/roam-options.txt
+# Build outputs and downloads (images go to GitHub Releases, not git)
+/output/
+/build/
+/*.img
+/*.img.gz
+/*.img.xz

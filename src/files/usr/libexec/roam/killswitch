@@ -1,0 +1,145 @@
+#!/bin/sh
+# Roam VPN kill switch.
+#   killswitch on    devices (LAN + guest) may only reach the Internet through the
+#                    WireGuard tunnel "wgclient"; if it is down, their traffic is dropped.
+#   killswitch off   back to normal (VPN, if on, still used; no blocking).
+#   killswitch status
+#
+# How: the tunnel gets its own firewall zone "vpn"; lan/guest forward only to it and
+# their forwardings to "wan" are disabled. DNS leaks: uplinks stop supplying DNS
+# servers (peerdns 0), so lookups use the VPN's DNS through the tunnel; the VPN
+# server's own hostname (if any) is resolved via Quad9 so the tunnel can still start.
+# The router itself keeps using the uplink (needed to bring the tunnel up).
+
+. /lib/functions.sh
+
+IFACE=wgclient
+PEER=wgclient_peer
+UPLINKS="wan wwan tether tether_ios"
+FALLBACK_DNS="9.9.9.9 1.1.1.1"
+BOOT_CANDIDATES="149.112.112.112 1.0.0.1 8.8.4.4"   # first one not used as VPN DNS
+
+wanzone=""
+find_wan() { [ "$(uci -q get firewall.$1.name)" = "wan" ] && wanzone=$1; }
+set_fwd() {   # set_fwd <src> <dest> <enabled 0|1>: (dis)able matching forwardings
+	local src dest
+	src=$(uci -q get firewall.$1.src); dest=$(uci -q get firewall.$1.dest)
+	[ "$src" = "$FWD_SRC" ] && [ "$dest" = "$FWD_DEST" ] || return 0
+	if [ "$FWD_EN" = 1 ]; then uci -q delete firewall.$1.enabled; else uci set firewall.$1.enabled='0'; fi
+}
+forwardings() { FWD_SRC=$1 FWD_DEST=$2 FWD_EN=$3; config_foreach set_fwd forwarding; }
+
+reload_all() {
+	uci commit firewall; uci commit network; uci commit dhcp; uci commit roam
+	/etc/init.d/firewall reload >/dev/null 2>&1
+	/etc/init.d/network reload >/dev/null 2>&1
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+}
+
+ks_off() {
+	config_load firewall
+	config_foreach find_wan zone
+	uci -q delete firewall.roam_vpn
+	uci -q delete firewall.roam_lan_vpn
+	uci -q delete firewall.roam_guest_vpn
+	uci -q delete firewall.roam_ks_dns
+	forwardings lan wan 1
+	forwardings guest wan 1
+	# Tunnel back into the wan zone (if a tunnel exists).
+	if uci -q get network.$IFACE >/dev/null && [ -n "$wanzone" ]; then
+		uci show firewall.$wanzone.network 2>/dev/null | grep -q "'$IFACE'" || uci add_list firewall.$wanzone.network=$IFACE
+	fi
+	# Undo DNS changes.
+	for n in $UPLINKS; do
+		[ "$(uci -q get roam.main.ks_peerdns_$n)" = "1" ] && uci -q delete network.$n.peerdns
+		uci -q delete roam.main.ks_peerdns_$n
+	done
+	if [ "$(uci -q get roam.main.ks_added_dns)" = "1" ]; then
+		uci -q delete network.$IFACE.dns
+		uci -q delete roam.main.ks_added_dns
+	fi
+	rule=$(uci -q get roam.main.ks_dns_rule)
+	[ -n "$rule" ] && uci -q del_list dhcp.@dnsmasq[0].server="$rule"
+	uci -q delete roam.main.ks_dns_rule
+	uci set roam.main.killswitch='0'
+	reload_all
+	echo off
+}
+
+ks_on() {
+	uci -q get network.$IFACE >/dev/null || { echo "no VPN configured" >&2; exit 1; }
+	config_load firewall
+	config_foreach find_wan zone
+
+	# Firewall: separate zone for the tunnel; lan/guest may only go there.
+	[ -n "$wanzone" ] && uci -q del_list firewall.$wanzone.network=$IFACE
+	uci -q batch <<-EOF
+		set firewall.roam_vpn=zone
+		set firewall.roam_vpn.name='vpn'
+		set firewall.roam_vpn.network='$IFACE'
+		set firewall.roam_vpn.input='REJECT'
+		set firewall.roam_vpn.output='ACCEPT'
+		set firewall.roam_vpn.forward='REJECT'
+		set firewall.roam_vpn.masq='1'
+		set firewall.roam_vpn.mtu_fix='1'
+		set firewall.roam_lan_vpn=forwarding
+		set firewall.roam_lan_vpn.src='lan'
+		set firewall.roam_lan_vpn.dest='vpn'
+	EOF
+	if uci -q get firewall.guest >/dev/null; then
+		uci set firewall.roam_guest_vpn=forwarding
+		uci set firewall.roam_guest_vpn.src='guest'
+		uci set firewall.roam_guest_vpn.dest='vpn'
+	fi
+	forwardings lan wan 0
+	forwardings guest wan 0
+
+	# DNS: don't use the hotel/ISP DNS servers; use the VPN's (through the tunnel).
+	for n in $UPLINKS; do
+		uci -q get network.$n >/dev/null || continue
+		if [ -z "$(uci -q get network.$n.peerdns)" ]; then
+			uci set network.$n.peerdns='0'
+			uci set roam.main.ks_peerdns_$n='1'
+		fi
+	done
+	if [ -z "$(uci -q get network.$IFACE.dns)" ]; then
+		for d in $FALLBACK_DNS; do uci add_list network.$IFACE.dns=$d; done
+		uci set roam.main.ks_added_dns='1'
+	fi
+	# Pick a bootstrap DNS server that is not one of the VPN's DNS servers.
+	vpndns=" $(uci -q get network.$IFACE.dns) "
+	BOOT_DNS=""
+	for c in $BOOT_CANDIDATES; do
+		case "$vpndns" in *" $c "*) ;; *) BOOT_DNS=$c; break ;; esac
+	done
+	# Leak protection: while the kill switch is on, the router sends no DNS out the
+	# uplinks (dnsmasq keeps its last servers when the tunnel's DNS disappears), except
+	# to the bootstrap server used for the VPN server's hostname.
+	uci -q batch <<-EOF
+		set firewall.roam_ks_dns=rule
+		set firewall.roam_ks_dns.name='Roam-KillSwitch-DNS'
+		set firewall.roam_ks_dns.dest='wan'
+		set firewall.roam_ks_dns.proto='tcp udp'
+		set firewall.roam_ks_dns.dest_port='53 853'
+		set firewall.roam_ks_dns.dest_ip='!$BOOT_DNS'
+		set firewall.roam_ks_dns.target='REJECT'
+	EOF
+	# The VPN server's hostname must still resolve while the tunnel is down.
+	host=$(uci -q get network.$PEER.endpoint_host)
+	if [ -n "$host" ] && ! echo "$host" | grep -qE '^[0-9.]+$|:'; then
+		rule="/$host/$BOOT_DNS"
+		uci -q del_list dhcp.@dnsmasq[0].server="$rule"
+		uci add_list dhcp.@dnsmasq[0].server="$rule"
+		uci set roam.main.ks_dns_rule="$rule"
+	fi
+	uci set roam.main.killswitch='1'
+	reload_all
+	echo on
+}
+
+case "$1" in
+	on) ks_on ;;
+	off) ks_off ;;
+	status) [ "$(uci -q get roam.main.killswitch)" = "1" ] && echo on || echo off ;;
+	*) echo "usage: $0 on|off|status" >&2; exit 1 ;;
+esac

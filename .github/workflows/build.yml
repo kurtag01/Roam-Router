@@ -1,0 +1,93 @@
+# Builds every Roam image. Pull requests and main: build only (catches breakage).
+# Tags vX.Y.Z: build, sign, and create a DRAFT release. Routers only see a release after
+# you have tested the draft and pressed "Publish" (see RELEASING.md).
+name: Build
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      ROAM_REPO: ${{ github.repository }}
+    steps:
+      - name: Free disk space (the host image needs ~12 GB while building)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - name: Build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd rsync gawk xz-utils file
+
+      - name: Version check (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          . ./versions.env
+          [ "${GITHUB_REF_NAME}" = "v${ROAM_VERSION}" ] || { echo "::error::tag ${GITHUB_REF_NAME} does not match ROAM_VERSION=${ROAM_VERSION} in versions.env"; exit 1; }
+
+      - name: Cache downloads (OpenWrt Image Builders, Raspberry Pi OS)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/openwrt-ib/*.tar.zst
+            ~/openwrt-ib/pi-os/*.img.xz
+          key: downloads-${{ hashFiles('versions.env') }}
+
+      - name: Build (router images, container, host bundle, host image)
+        env:
+          ROAM_SIGNING_KEY: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ROAM_SIGNING_KEY || '' }}
+        run: ./build.sh release
+
+      - name: Signature required for releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          test -s output/release/SHA256SUMS.sig || { echo "::error::No signature: add the ROAM_SIGNING_KEY secret (see RELEASING.md)"; exit 1; }
+
+      - name: Keep the small files of test builds (7 days)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: roam-test-build
+          retention-days: 7
+          path: |
+            output/release/*.img.gz
+            output/release/roam-release.json
+            output/release/SHA256SUMS
+
+      - name: Create draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          . ./versions.env
+          {
+            echo "**Roam ${ROAM_VERSION}** with OpenWrt ${OPENWRT_VERSION}"
+            echo
+            echo "| Download | For |"
+            echo "|---|---|"
+            echo "| \`roam-host-pi4-${ROAM_VERSION}.img.xz\` | Pi 4 with router + Games + Plex: flash to an SD card |"
+            echo "| \`roam-${ROAM_VERSION}-rpi4-factory.img.gz\` | Pi 4 as a router only: flash to an SD card |"
+            echo "| \`roam-${ROAM_VERSION}-rpi4-sysupgrade.img.gz\`, \`roam-host-${ROAM_VERSION}.tar.gz\` | Used by the routers' Updates page |"
+            echo
+            echo "App versions: $(sed -n 's/^ *image: *//p' src/host/apps/compose.yml | tr '\n' ' ')"
+            echo
+            echo "Check downloads with \`sha256sum -c SHA256SUMS\`; \`SHA256SUMS.sig\` is verified by the routers."
+          } > notes.md
+          gh release create "${GITHUB_REF_NAME}" output/release/* --draft --title "Roam ${ROAM_VERSION}" --notes-file notes.md --generate-notes

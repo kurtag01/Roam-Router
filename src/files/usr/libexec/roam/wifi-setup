@@ -1,0 +1,111 @@
+#!/bin/sh
+# Roam: one-time Wi-Fi role setup.
+#  - 2 radios (built-in + USB adapter): USB adapter broadcasts the SSIDs, built-in
+#    radio connects to the upstream network (repeater).
+#  - 1 radio: it does both (repeater + access point on the same channel).
+# Roles can be changed later on the Wireless page. "wifi-setup force" redoes it.
+
+. /lib/functions.sh
+
+[ "$(uci -q get roam.main.wifi_done)" = "1" ] && [ "$1" != "force" ] && exit 0
+
+# USB adapters finish probing a few seconds after boot: wait until the number of
+# radios has been stable for 6 seconds (max ~40 s).
+last=-1; stable=0; n=0
+while [ $n -lt 40 ]; do
+	c=$(ls /sys/class/ieee80211 2>/dev/null | wc -l)
+	if [ "$c" = "$last" ]; then stable=$((stable + 1)); else stable=0; fi
+	last=$c
+	[ "$c" -gt 0 ] && [ $stable -ge 6 ] && break
+	sleep 1; n=$((n + 1))
+done
+[ "$last" -gt 0 ] || { logger -t roam "no Wi-Fi radios found; will retry next boot"; exit 0; }
+
+/sbin/wifi config
+
+usb=""; builtin=""
+check_radio() {
+	local path
+	path=$(uci -q get wireless.$1.path)
+	case "$path" in
+		*usb*) [ -z "$usb" ] && usb=$1 ;;
+		*)     [ -z "$builtin" ] && builtin=$1 ;;
+	esac
+}
+del_default() {
+	case "$1" in default_radio*) uci -q delete wireless.$1 ;; esac
+}
+
+config_load wireless
+config_foreach check_radio wifi-device
+config_foreach del_default wifi-iface
+
+if [ -n "$usb" ] && [ -n "$builtin" ]; then
+	ap=$usb; sta=$builtin
+else
+	ap=${usb:-$builtin}; sta=$ap
+fi
+[ -n "$ap" ] || exit 0
+
+suffix=$(tr -d ':\n' < /sys/class/net/eth0/address 2>/dev/null | tail -c 4 | tr 'a-f' 'A-F')
+[ -n "$suffix" ] || suffix=$(head -c 2 /dev/urandom | hexdump -e '2/1 "%02X"')
+ssid="Roam-$suffix"
+
+for r in $ap $sta; do
+	uci set wireless.$r.disabled='0'
+	case "$(uci -q get wireless.$r.country)" in ''|00) uci set wireless.$r.country='US' ;; esac
+	# Wi-Fi 6E adapters (e.g. Panda PAU0F / MT7921AU) default to 6 GHz, which only
+	# allows WPA3 and is invisible to older devices: use 5 GHz instead.
+	if [ "$(uci -q get wireless.$r.band)" = "6g" ]; then
+		uci set wireless.$r.band='5g'
+		uci set wireless.$r.channel='36'
+	fi
+done
+
+# Fixed channel for the access point when it has its own radio (some USB chips have
+# no automatic channel selection). With one radio the AP follows the uplink's channel.
+if [ "$ap" != "$sta" ]; then
+	case "$(uci -q get wireless.$ap.band)" in
+		5g) uci set wireless.$ap.channel='36' ;;
+		2g) uci set wireless.$ap.channel='6' ;;
+	esac
+fi
+
+uci -q batch <<EOF
+set wireless.ap=wifi-iface
+set wireless.ap.device='$ap'
+set wireless.ap.mode='ap'
+set wireless.ap.network='lan'
+set wireless.ap.ssid='$ssid'
+set wireless.ap.encryption='psk2'
+set wireless.ap.key='roam-pi-setup'
+set wireless.ap.disabled='0'
+
+set wireless.guest=wifi-iface
+set wireless.guest.device='$ap'
+set wireless.guest.mode='ap'
+set wireless.guest.network='guest'
+set wireless.guest.ssid='$ssid-Guest'
+set wireless.guest.encryption='psk2'
+set wireless.guest.key='roam-guest-setup'
+set wireless.guest.isolate='1'
+set wireless.guest.disabled='1'
+
+set wireless.wwan=wifi-iface
+set wireless.wwan.device='$sta'
+set wireless.wwan.mode='sta'
+set wireless.wwan.network='wwan'
+set wireless.wwan.ssid=''
+set wireless.wwan.encryption='none'
+set wireless.wwan.disabled='1'
+commit wireless
+
+set roam.main.wifi_done='1'
+set roam.main.ap_radio='$ap'
+set roam.main.sta_radio='$sta'
+commit roam
+EOF
+
+logger -t roam "Wi-Fi set up: access point on $ap ($ssid), uplink radio $sta"
+/sbin/wifi reload
+exit 0

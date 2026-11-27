@@ -1,0 +1,46 @@
+#!/bin/sh
+# Host network setup.
+#   host-link up        router container running: host is 192.168.8.2 on its LAN
+#   host-link fallback  router stopped/failed: give the Ethernet port back to the host
+#                       (DHCP) so the Pi stays reachable for repairs.
+HOST_IP=192.168.8.2
+ROUTER_IP=192.168.8.1
+ETH=$(sed -n 's/^lxc.net.0.link = //p' /var/lib/lxc/roam/config 2>/dev/null); ETH=${ETH:-eth0}
+
+# DNS for the host: systemd-resolved (Debian/Ubuntu) or a plain /etc/resolv.conf (Pi OS).
+set_dns() {
+	if systemctl -q is-active systemd-resolved 2>/dev/null; then
+		resolvectl dns rhost $1 2>/dev/null
+		resolvectl domain rhost ${2:+$2} '~.' 2>/dev/null
+	else
+		rm -f /etc/resolv.conf
+		{ for s in $1; do echo "nameserver $s"; done; [ -n "$2" ] && echo "search $2"; } > /etc/resolv.conf
+	fi
+}
+
+case "$1" in
+up)
+	i=0
+	while [ $i -lt 60 ] && ! ip link show rhost >/dev/null 2>&1; do sleep 1; i=$((i + 1)); done
+	ip link show rhost >/dev/null 2>&1 || { logger -t roam "host-link: rhost did not appear"; exit 1; }
+	ip link set rhost up
+	ip addr replace $HOST_IP/24 dev rhost
+	ip route replace default via $ROUTER_IP dev rhost metric 50
+	set_dns $ROUTER_IP lan
+	logger -t roam "host-link: host is $HOST_IP on the router LAN"
+	;;
+fallback)
+	ip route del default via $ROUTER_IP dev rhost 2>/dev/null
+	set_dns "1.1.1.1 9.9.9.9" 
+	sleep 2
+	if command -v nmcli >/dev/null; then
+		nmcli device set "$ETH" managed yes 2>/dev/null
+		nmcli device connect "$ETH" 2>/dev/null
+	elif command -v dhclient >/dev/null; then
+		ip link set "$ETH" up; dhclient -nw "$ETH"
+	fi
+	logger -t roam "host-link: router not running, $ETH handed back to the host (DHCP)"
+	;;
+*) echo "usage: $0 up|fallback" >&2; exit 1 ;;
+esac
+exit 0

@@ -1,0 +1,104 @@
+{#
+ Roam theme for LuCI: sidebar layout on top of the Bootstrap theme's widget styles.
+ Licensed under the Apache License 2.0 (same as LuCI).
+-#}
+
+{%
+	import { getuid, getspnam } from 'luci.core';
+
+	const boardinfo = ubus.call('system', 'board');
+	const hostname = boardinfo?.hostname ?? 'Router';
+
+	http.prepare_content('text/html; charset=UTF-8');
+-%}
+
+<!DOCTYPE html>
+<html lang="{{ dispatcher.lang }}" data-darkmode="false">
+	<head>
+		<meta charset="utf-8">
+		<title>{{ striptags(`${hostname}${dispatched?.title ? ` | ${_(dispatched.title)}` : ''}`) }}</title>
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<meta name="darkreader-lock">
+		<script>
+			/* Theme: 'auto' (follow the device), 'dark' or 'light'; remembered per browser. */
+			(function() {
+				var pref = 'auto', mq = window.matchMedia('(prefers-color-scheme: dark)'), root = document.documentElement;
+				try { pref = localStorage.getItem('roam-theme') || 'auto'; } catch (e) {}
+				function apply() {
+					var dark = (pref == 'dark') || (pref == 'auto' && mq.matches);
+					root.setAttribute('data-darkmode', dark ? 'true' : 'false');
+					root.setAttribute('data-roam-theme', pref);
+				}
+				apply();
+				mq.addEventListener('change', apply);
+				window.roamTheme = function(next) {
+					if (next) { pref = next; try { localStorage.setItem('roam-theme', next); } catch (e) {} apply(); }
+					return pref;
+				};
+			})();
+		</script>
+		<link rel="stylesheet" href="/luci-static/bootstrap/cascade.css">
+		<link rel="stylesheet" href="{{ media }}/roam.css?v=1">
+		<link rel="icon" href="{{ media }}/logo.svg" sizes="any">
+		{% if (node?.css): %}
+		<link rel="stylesheet" href="{{ resource }}/{{ node.css }}">
+		{% endif %}
+		{% if (css): %}
+		<style title="text/css">{{ css }}</style>
+		{% endif %}
+		<script src="{{ dispatcher.build_url('admin/translations', dispatcher.lang) }}"></script>
+		<script src="{{ resource }}/cbi.js"></script>
+	</head>
+
+	<body class="roam lang_{{ dispatcher.lang }} {{ blank_page ? 'roam-blank' : '' }}" data-page="{{ entityencode(join('-', ctx.request_path), true) }}">
+		{% if (!blank_page): %}
+		<div id="roam-shell">
+			<aside id="roam-side">
+				<a class="roam-brand" href="{{ dispatcher.build_url('admin') }}">
+					<img src="{{ media }}/logo.svg" alt="" width="34" height="34">
+					<span>
+						<strong>{{ striptags(hostname) }}</strong>
+						<small>Travel Router</small>
+					</span>
+				</a>
+				<nav id="roam-nav"></nav>
+			</aside>
+			<div id="roam-scrim"></div>
+			<div id="roam-body">
+				<div id="roam-top">
+					<button id="roam-burger" type="button" aria-label="Menu">
+						<svg viewBox="0 0 24 24" width="22" height="22"><path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+					</button>
+					<h1 id="roam-title">{{ striptags(_(dispatched?.title ?? '')) }}</h1>
+					<div id="indicators"></div>
+					<button id="roam-mode" type="button" title="Appearance"></button>
+					<a id="roam-logout" href="{{ dispatcher.build_url('admin/logout') }}" title="{{ _('Log out') }}">
+						<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
+					</a>
+				</div>
+
+				<div id="maincontent" class="container">
+					{% if (getuid() == 0 && getspnam('root')?.pwdp === ''): %}
+					<div class="alert-message warning roam-alert">
+						<h4>{{ _('No admin password set') }}</h4>
+						<p>Anyone who can reach this router can change its settings. Set a password now.</p>
+						<div class="right"><a class="btn cbi-button-action" href="{{ dispatcher.build_url('admin/roam/system') }}">Set password</a></div>
+					</div>
+					{% endif %}
+
+					{% if (boardinfo?.rootfs_type == "initramfs"): %}
+					<div class="alert-message warning">
+						<h4>{{ _('System running in recovery (initramfs) mode.') }}</h4>
+						<p>{{ _('No changes to settings will be stored and are lost after rebooting. This mode should only be used to install a firmware upgrade') }}</p>
+					</div>
+					{% endif %}
+
+					<noscript>
+						<div class="alert-message warning">
+							<h4>{{ _('JavaScript required!') }}</h4>
+							<p>{{ _('You must enable JavaScript in your browser or LuCI will not work properly.') }}</p>
+						</div>
+					</noscript>
+
+					<div id="tabmenu" style="display:none"></div>
+		{% endif %}
