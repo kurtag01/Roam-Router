@@ -5,6 +5,12 @@ image) with a simpler, card-based web interface laid out like a commercial trave
 It has no GL.iNet software or artwork. The full OpenWrt interface (LuCI) is still there,
 under **Advanced Settings** in the sidebar.
 
+**Download:** the newest images are on the [Releases page](https://github.com/kurtag01/Roam-Router/releases/latest):
+- `roam-host-pi4-<version>.img.xz`: Pi 4 as router **plus Games (RomM) and Plex**. Flash to an SD card ([Roam host](#roam-host-router--games--plex-on-raspberry-pi-os)).
+- `roam-<version>-rpi4-factory.img.gz`: Pi 4 as a router only. Flash to an SD card.
+
+Installed routers update themselves from the same page: see [Updates](#updates).
+
 ## Flash it
 
 Image: `output/openwrt-25.12.6-roam-bcm27xx-bcm2711-rpi-4-squashfs-factory.img.gz`
