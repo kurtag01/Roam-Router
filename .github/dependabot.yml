@@ -6,6 +6,11 @@ updates:
     directory: /src/host/apps
     schedule:
       interval: weekly
+    ignore:
+      # Stay on MariaDB 11.8 (long-term support): a new major version needs a database
+      # upgrade step that RomM's setup does not run. Bug-fix releases (11.8.x) still come.
+      - dependency-name: mariadb
+        update-types: [ "version-update:semver-major", "version-update:semver-minor" ]
   - package-ecosystem: github-actions
     directory: /
     schedule:
