@@ -56,7 +56,7 @@ jobs:
           printf '%s\n' "$K" | head -1 | grep -q '^untrusted comment:' || echo "::warning::The first line should start with 'untrusted comment:' (paste the whole .sec file)"
 
       - name: Cache downloads (OpenWrt Image Builders, Raspberry Pi OS)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/openwrt-ib/*.tar.zst
