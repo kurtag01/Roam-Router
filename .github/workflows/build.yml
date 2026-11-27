@@ -42,6 +42,19 @@ jobs:
           . ./versions.env
           [ "${GITHUB_REF_NAME}" = "v${ROAM_VERSION}" ] || { echo "::error::tag ${GITHUB_REF_NAME} does not match ROAM_VERSION=${ROAM_VERSION} in versions.env"; exit 1; }
 
+      - name: Signing key check (tags only; prints only its size, never the key)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          K: ${{ secrets.ROAM_SIGNING_KEY }}
+        run: |
+          if [ -z "$K" ]; then
+            echo "::error::The repository secret ROAM_SIGNING_KEY is empty or not visible to this workflow. It must be under Settings > Secrets and variables > Actions > Repository secrets."
+            exit 1
+          fi
+          lines=$(printf '%s\n' "$K" | grep -c .)
+          echo "::notice::ROAM_SIGNING_KEY present: ${#K} characters, $lines non-empty lines (expected about 176 characters, 2 lines)"
+          printf '%s\n' "$K" | head -1 | grep -q '^untrusted comment:' || echo "::warning::The first line should start with 'untrusted comment:' (paste the whole .sec file)"
+
       - name: Cache downloads (OpenWrt Image Builders, Raspberry Pi OS)
         uses: actions/cache@v4
         with:
