@@ -18,6 +18,7 @@ watch_log() {
 				ip=${line##* from }; what="the router's web page" ;;
 			*"Bad password attempt"*|*"nonexistent user"*)
 				ip=${line##* from }; ip=${ip%:*}; what="SSH" ;;
+			*"banIP/outbound/"*) threat "$line"; continue ;;
 			*) continue ;;
 		esac
 		ip=$(echo "$ip" | tr -cd '0-9a-fA-F.:')
@@ -25,6 +26,34 @@ watch_log() {
 			"Someone at $ip entered a wrong password for $what. If this was not you, a device on your network may be trying to get into the router." \
 			--priority 4 --tags warning,lock --key "login $ip" --cooldown 900
 	done
+}
+
+# ---- blocked threats (banIP) ------------------------------------------------------------
+LISTS="spamhaus:Spamhaus DROP (hijacked and criminal networks)
+feodo:Feodo Tracker (botnet command servers)
+hagezi:HaGeZi threat list (malware and phishing servers)
+threatview:ThreatView (malicious servers)
+threat:Emerging Threats (known attackers and botnets)
+webclient:malware servers
+etcompromised:compromised hosts
+cinsscore:suspicious hosts (CINS)
+ipsum:malicious IPs (IPsum)
+debl:attacking hosts (blocklist.de)
+greensnow:attacking hosts (GreenSnow)"
+
+threat() {
+	local line=$1 list src dst mac name w
+	list=$(echo "$line" | sed -n 's|.*banIP/outbound/[a-z]*/\([a-z0-9]*\)\.v[46].*|\1|p')
+	case "$list" in ''|country|blocklist|allowlist) return ;; esac   # countries: your own choice
+	src=$(echo "$line" | sed -n 's/.* SRC=\([0-9a-fA-F.:]*\) .*/\1/p')
+	dst=$(echo "$line" | sed -n 's/.* DST=\([0-9a-fA-F.:]*\) .*/\1/p')
+	mac=$(echo "$line" | sed -n 's/.* MAC=[0-9a-f:]\{17\}:\([0-9a-f:]\{17\}\).*/\1/p')
+	[ -n "$src" ] || return
+	name=$(awk -v m="$mac" -v i="$src" '($2 == m || $3 == i) && $4 != "*" { print $4; exit }' /tmp/dhcp.leases 2>/dev/null | tr -cd 'A-Za-z0-9._ -' | cut -c1-40)
+	w=$(echo "$LISTS" | sed -n "s/^$list://p"); w=${w:-the $list threat list}
+	$N event threat "Blocked a dangerous connection" \
+		"${name:-A device} ($src${mac:+, $mac}) tried to connect to $dst, which is on $w. Roam blocked it. If this keeps happening, check that device for malware." \
+		--priority 4 --tags no_entry,warning --key "threat ${mac:-$src}" --cooldown 3600
 }
 
 # ---- VPN ------------------------------------------------------------------------------

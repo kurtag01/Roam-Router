@@ -1,0 +1,38 @@
+#!/bin/sh
+# Threat and country blocking (banIP), set up for a travel router. Off until turned on in
+# Security; once Roam has set it up (banip.global.roam_setup), user changes are kept.
+#  - interfaces: managed by /usr/libexec/roam/banip sync (all uplinks + VPN), not autodetect
+#  - lists: outbound threat lists (devices on your Wi-Fi reaching botnet/malware servers);
+#    no firehol1 (contains the private ranges hotel networks use), never vpn/dns/doh feeds
+#  - no banning after failed logins (that would lock out your own devices); notifications
+#    report failed sign-ins instead
+
+[ -f /etc/config/banip ] || exit 0
+if [ "$(uci -q get banip.global.roam_setup)" != 1 ]; then
+	uci -q batch <<'B'
+set banip.global.ban_enabled='0'
+set banip.global.ban_autodetect='0'
+delete banip.global.ban_logterm
+set banip.global.ban_autoblocklist='0'
+set banip.global.ban_logoutbound='1'
+set banip.global.ban_fetchretry='3'
+delete banip.global.ban_feed
+add_list banip.global.ban_feed='spamhaus'
+add_list banip.global.ban_feed='feodo'
+add_list banip.global.ban_feed='hagezi'
+add_list banip.global.ban_feed='threatview'
+delete banip.global.ban_feedinout
+add_list banip.global.ban_feedinout='country'
+set banip.global.roam_setup='1'
+commit banip
+B
+fi
+/etc/init.d/banip stop >/dev/null 2>&1
+[ "$(uci -q get banip.global.ban_enabled)" = 1 ] || /etc/init.d/banip disable
+
+# Safety net for interface changes, and a daily list update (random minute: not every
+# router at once).
+touch /etc/crontabs/root
+grep -q 'roam/banip sync' /etc/crontabs/root || echo '*/5 * * * * /usr/libexec/roam/banip sync' >> /etc/crontabs/root
+grep -q 'roam/banip refresh' /etc/crontabs/root || echo "$(awk 'BEGIN{srand(); print int(rand()*60)}') 4 * * * /usr/libexec/roam/banip refresh" >> /etc/crontabs/root
+exit 0

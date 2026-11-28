@@ -50,7 +50,8 @@ The router uses **192.168.8.x** for its own network, so it doesn't clash with th
 | VPN | Add a WireGuard configuration from any provider: drag the `.conf` file onto the WireGuard card or the import window, choose it, paste it, or type the values into a form. Everything is checked before it is saved (an OpenVPN `.ovpn` is recognised and sent to the OpenVPN page). On/off, handshake and traffic. **UniFi Teleport** (experimental): paste an invite link from your UniFi gateway to use your home connection. **Kill switch.** OpenVPN is under Advanced. |
 | Network | **Encrypted DNS** (DNS-over-HTTPS): off, Cloudflare, Quad9, Mullvad (optionally with ad blocking), AdGuard, Google or a custom server. Also: router LAN address, DHCP range and lease time, plain custom DNS, DNS rebind protection. |
 | System | **Hostname**, time zone, admin password (strong-password rules with an on/off switch, password generator), restart, links to backup, firmware and software. |
-| Notifications | Alerts to your phone (**ntfy** app, scan the QR code) and/or **email** (Gmail, iCloud, Yahoo, Fastmail or any SMTP server), with **Send test** buttons. Choose what to send: new devices, VPN drops, failed sign-ins, updates, restarts. See [Notifications](#notifications). |
+| Security | **Threat blocking** (banIP): stops every device from reaching known botnet, malware and attacker addresses, also through the VPN. Standard or Strict lists, updated daily. **Country blocking**, a list of recently blocked connections with an **Allow** button. See [Security](#security-threat-and-country-blocking). |
+| Notifications | Alerts to your phone (**ntfy** app, scan the QR code) and/or **email** (Gmail, iCloud, Yahoo, Fastmail or any SMTP server), with **Send test** buttons. Choose what to send: new devices, VPN drops, failed sign-ins, blocked threats, updates, restarts. See [Notifications](#notifications). |
 | Updates | Current Roam and OpenWrt version, **Check for updates**, **Install update** with progress, daily automatic check (on by default). The Dashboard shows when an update is available. See [Updates](#updates). |
 | Advanced Settings | All of standard OpenWrt LuCI: firewall, routing, VLANs, packages, logs, SSH and so on. |
 
@@ -147,6 +148,35 @@ VPN › UniFi Teleport connects the router to your home UniFi gateway, so everyt
 | Uplink blocked for 45 s | Renegotiated on its own; laptop back online about 80 s after the uplink returned |
 | Invalid or used invite | Clear error in the UI; no retries |
 
+## Security: threat and country blocking
+
+The Security page runs [banIP](https://github.com/openwrt/packages/tree/master/net/banip), which drops connections using nftables sets.
+
+**What it blocks:**
+- **Outgoing connections are what matter on a travel router.** Roam has no open ports, so the useful part is stopping a device on your Wi-Fi from talking to a botnet command server or malware host.
+- **Standard** (default): Spamhaus DROP, Feodo Tracker, HaGeZi threat IPs and ThreatView. Very few false positives.
+- **Strict:** adds Emerging Threats, malware servers, ET compromised hosts, CINS, IPsum, blocklist.de and GreenSnow.
+- **Countries:** blocked in both directions.
+- **Advanced › banIP** has every other option. If you choose your own lists there, the page shows "Custom".
+
+**What it deliberately doesn't do:**
+- **No FireHOL level 1.** It contains the private address ranges hotel and home networks use.
+- **No `vpn`, `vpndc`, `dns` or `doh` lists.** They would block your VPN or encrypted DNS.
+- **No banning after failed logins.** One typo would lock out your own laptop. Notifications report failed sign-ins instead.
+
+**Roam's glue** is `/usr/libexec/roam/banip`. banIP normally watches only the single interface holding the main default route, which is the hotel uplink and never the VPN tunnel, so with the VPN on nothing would be checked. And if banIP is set to watch an interface that no longer exists (for example after you remove the VPN), it stops completely.
+- `banip sync` sets banIP's interfaces and devices to every uplink plus WireGuard/Teleport that exist right now, and restarts banIP if the list changed or it isn't running.
+- It runs when an uplink or VPN comes up or goes down (`/etc/hotplug.d/iface/40-roam-banip`), and every 5 minutes as a safety net.
+- `banip refresh` updates the lists daily at a random minute.
+- `status`, `recent` and `allow` feed the Security page.
+
+**Tested** in the VM:
+- **Standard:** about 46,000 addresses.
+- **Strict:** about 83,000 addresses, loading in 3–6 s and using about 25 MB of RAM.
+- **Coverage:** the outgoing check covers every uplink and the `teleport` device.
+- **Botnet block:** a LAN device trying two Feodo botnet addresses was refused both times. Both blocks show on the page, and exactly one "Blocked a dangerous connection" alert arrived via ntfy.
+- **Recovery:** removing a watched interface made banIP fail at its next start, and `banip sync` restored it.
+
 ## Notifications
 
 The Notifications page sends alerts to your phone and/or by email.
@@ -167,6 +197,7 @@ The Notifications page sends alerts to your phone and/or by email.
 | New devices | A device gets an address on the main or guest network for the first time. Devices already there when notifications start are not reported. |
 | VPN | The active VPN (WireGuard or Teleport) stays down for more than a minute, and again when it reconnects. The message says whether the kill switch is keeping your devices offline. |
 | Failed sign-ins | A wrong password on the web page or over SSH, with the source address. |
+| Blocked threats | Threat blocking stopped a device from reaching a botnet or malware address (once an hour per device). Country blocks are not reported. |
 | Updates | A new Roam version is available (once per version), or the router was updated. |
 | Router restarts | The router started, for example after a power cut. |
 

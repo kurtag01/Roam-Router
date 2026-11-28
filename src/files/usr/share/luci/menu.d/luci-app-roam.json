@@ -78,7 +78,7 @@
  },
  "admin/roam/network": {
   "title": "Network",
-  "order": 6,
+  "order": 7,
   "action": {
    "type": "view",
    "path": "roam/network"
@@ -91,7 +91,7 @@
  },
  "admin/roam/system": {
   "title": "System",
-  "order": 7,
+  "order": 8,
   "action": {
    "type": "view",
    "path": "roam/system"
@@ -104,7 +104,7 @@
  },
  "admin/roam/update": {
   "title": "Updates",
-  "order": 9,
+  "order": 10,
   "action": {
    "type": "view",
    "path": "roam/update"
@@ -117,10 +117,23 @@
  },
  "admin/roam/notify": {
   "title": "Notifications",
-  "order": 8,
+  "order": 9,
   "action": {
    "type": "view",
    "path": "roam/notify"
+  },
+  "depends": {
+   "acl": [
+    "luci-app-roam"
+   ]
+  }
+ },
+ "admin/roam/security": {
+  "title": "Security",
+  "order": 6,
+  "action": {
+   "type": "view",
+   "path": "roam/security"
   },
   "depends": {
    "acl": [

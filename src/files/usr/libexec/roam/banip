@@ -1,0 +1,133 @@
+#!/bin/sh
+# Roam's glue for banIP (threat and country blocking).
+#
+#   banip sync      point banIP at the interfaces that exist now: every uplink plus the VPN
+#                   (WireGuard, Teleport). banIP itself only knows the one uplink holding the
+#                   main default route, so traffic through the VPN would go unchecked, and a
+#                   listed interface that no longer exists makes it stop. Restarts banIP when
+#                   the list changed or it is not running. Run from hotplug, cron and the UI.
+#   banip apply     sync, then start (and enable) or stop (and disable) as configured
+#   banip refresh   sync, then download the lists again (daily cron)
+#   banip status    JSON for the Security page: state, address count, blocked counts
+#   banip recent    recent blocked connections from devices on your network (JSON lines)
+#   banip allow <ip>  add an address to banIP's allowlist and reload
+
+. /lib/functions/network.sh
+
+UPLINKS4="wan wwan tether tether_ios wgclient teleport"
+UPLINKS6="wan6"
+INIT=/etc/init.d/banip
+RT=/var/run/banIP/banIP.runtime.json
+LOCK=/var/run/roam-banip.lock
+
+enabled() { [ "$(uci -q get banip.global.ban_enabled)" = 1 ]; }
+active() { grep -q '"status": "active"' $RT 2>/dev/null; }
+exists() { ubus list "network.interface.$1" >/dev/null 2>&1; }
+
+# Current interfaces and devices (sorted, space separated).
+want() {
+	local i d ifs4="" ifs6="" devs=""
+	network_flush_cache
+	for i in $UPLINKS4; do
+		exists $i || continue
+		ifs4="$ifs4 $i"
+		d=""; network_get_device d $i
+		[ -n "$d" ] || d=$(uci -q get network.$i.device)
+		case "$i" in teleport|wgclient) d=${d:-$i} ;; esac
+		case "$d" in ''|@*|br-lan|br-guest) ;; *) devs="$devs $d" ;; esac
+	done
+	for i in $UPLINKS6; do exists $i && ifs6="$ifs6 $i"; done
+	W4=$(echo $ifs4 | tr ' ' '\n' | sort -u | tr '\n' ' '); W4=${W4% }
+	W6=$(echo $ifs6 | tr ' ' '\n' | sort -u | tr '\n' ' '); W6=${W6% }
+	WD=$(echo $devs | tr ' ' '\n' | sort -u | tr '\n' ' '); WD=${WD% }
+}
+
+have() { echo $(uci -q get banip.global.$1 | tr ' ' '\n' | sort -u); }
+
+setlist() {   # setlist <option> <values>
+	local v
+	uci -q delete banip.global.$1
+	for v in $2; do uci add_list banip.global.$1="$v"; done
+}
+
+sync() {
+	enabled || return 0
+	mkdir $LOCK 2>/dev/null || {
+		# another sync is running (a lock older than 5 minutes is stale)
+		[ $(( $(date +%s) - $(date -r $LOCK +%s 2>/dev/null || date +%s) )) -gt 300 ] || return 0
+	}
+	want
+	local changed=""
+	[ "$(uci -q get banip.global.ban_autodetect)" = 0 ] || { uci set banip.global.ban_autodetect=0; changed=1; }
+	[ "$(have ban_ifv4)" = "$W4" ] || { setlist ban_ifv4 "$W4"; changed=1; }
+	[ "$(have ban_ifv6)" = "$W6" ] || { setlist ban_ifv6 "$W6"; changed=1; }
+	[ "$(have ban_dev)" = "$WD" ] || { setlist ban_dev "$WD"; changed=1; }
+	[ -n "$W6" ] && uci set banip.global.ban_protov6=1 || uci set banip.global.ban_protov6=0
+	uci set banip.global.ban_protov4=1
+	[ -n "$(uci -q changes banip)" ] && uci commit banip
+	if [ -n "$changed" ] || [ -n "$FORCE" ] || ! active; then
+		[ -n "$changed" ] && logger -t roam-banip "interfaces: ${W4:-none} / devices: ${WD:-none}"
+		$INIT enabled || $INIT enable
+		$INIT restart >/dev/null 2>&1
+	fi
+	rmdir $LOCK 2>/dev/null
+	return 0
+}
+
+status() {
+	local out=0 inb=0 st="off" count="" last=""
+	if active; then
+		st=active
+		count=$(jsonfilter -i $RT -e '@.element_count' | cut -d'(' -f1 | tr -cd '0-9')
+		last=$(jsonfilter -i $RT -e '@.last_run' | sed -n 's/.*date \/ time: \([0-9: -]*\).*/\1/p')
+		out=$(nft list chain inet banIP _outbound 2>/dev/null | awk '/goto _reject|drop$/ { for (i=1;i<=NF;i++) if ($i=="packets") s+=$(i+1) } END { print s+0 }')
+		inb=$(nft list chain inet banIP _inbound 2>/dev/null | awk '/drop$|goto/ { for (i=1;i<=NF;i++) if ($i=="packets") s+=$(i+1) } END { print s+0 }')
+	elif enabled; then
+		st=$(jsonfilter -i $RT -e '@.status' 2>/dev/null); st=${st:-starting}
+	fi
+	printf '{"state":"%s","addresses":"%s","updated":"%s","blocked_out":%s,"blocked_in":%s}\n' \
+		"$st" "$count" "$(echo "$last" | sed 's/ *$//')" "${out:-0}" "${inb:-0}"
+}
+
+# Recent outgoing blocks: {"time","src","mac","dst","list"}, newest first.
+recent() {
+	logread -e 'banIP/outbound/' 2>/dev/null | tail -n 200 | awk '
+		{
+			t = $2 " " $3 " " $4; list = ""; src = ""; dst = ""; mac = ""; port = ""
+			for (i = 1; i <= NF; i++) {
+				if ($i ~ /^banIP\/outbound\//) { n = split($i, a, "/"); list = a[4]; sub(/:$/, "", list) }
+				else if ($i ~ /^SRC=/) src = substr($i, 5)
+				else if ($i ~ /^DST=/) dst = substr($i, 5)
+				else if ($i ~ /^DPT=/) port = substr($i, 5)
+				else if ($i ~ /^MAC=/) { m = substr($i, 5); if (length(m) >= 35) mac = substr(m, 19, 17) }
+			}
+			if (src != "") printf("{\"time\":\"%s\",\"src\":\"%s\",\"mac\":\"%s\",\"dst\":\"%s\",\"port\":\"%s\",\"list\":\"%s\"}\n", t, src, mac, dst, port, list)
+		}' | sed '1!G;h;$!d' | head -n 30
+}
+
+allow() {
+	echo "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$|^[0-9a-fA-F:]+(/[0-9]{1,3})?$' ||
+		{ echo "Not an IP address: $1" >&2; return 1; }
+	grep -qxF "$1" /etc/banip/banip.allowlist 2>/dev/null || echo "$1" >> /etc/banip/banip.allowlist
+	active && $INIT reload >/dev/null 2>&1
+	return 0
+}
+
+case "$1" in
+	sync) sync ;;
+	apply)
+		if enabled; then
+			$INIT enable
+			rmdir $LOCK 2>/dev/null
+			FORCE=1 sync   # new lists or countries: always reload
+		else
+			$INIT stop >/dev/null 2>&1
+			$INIT disable
+		fi
+		;;
+	refresh) enabled && { sync; active && $INIT reload >/dev/null 2>&1; } ;;
+	status) status ;;
+	recent) recent ;;
+	allow) allow "$2" ;;
+	*) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
+esac

@@ -54,6 +54,9 @@
     ],
     "/tmp/run/teleport.json": [
      "read"
+    ],
+    "/etc/banip/banip.countries": [
+     "read"
     ]
    },
    "uci": [
@@ -64,7 +67,8 @@
     "system",
     "luci",
     "roam",
-    "https-dns-proxy"
+    "https-dns-proxy",
+    "banip"
    ]
   },
   "write": {
@@ -120,6 +124,9 @@
     ],
     "/usr/libexec/roam/notify": [
      "exec"
+    ],
+    "/usr/libexec/roam/banip": [
+     "exec"
     ]
    },
    "uci": [
@@ -130,7 +137,8 @@
     "system",
     "luci",
     "roam",
-    "https-dns-proxy"
+    "https-dns-proxy",
+    "banip"
    ]
   }
  }

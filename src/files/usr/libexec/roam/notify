@@ -4,7 +4,7 @@
 #   notify event <type> <title> <message> [--priority 1-5] [--tags a,b] [--key K]
 #                [--cooldown S] [--once K]
 #        Queue a notification if notifications and the <type> are turned on, then send it.
-#        Types: device, vpn, login, update, system. --cooldown: skip repeats of the same
+#        Types: device, vpn, login, update, system, threat. --cooldown: skip repeats of the same
 #        key (default: type+title) for S seconds (default 300). --once: send only once
 #        ever for key K (kept in /etc/roam/notify-once).
 #   notify flush             send what is queued (undelivered messages are retried for 24 h)
@@ -185,7 +185,7 @@ event() {
 		shift
 	done
 	case "$prio" in [1-5]) ;; *) prio=3 ;; esac
-	case "$type" in device|vpn|login|update|system) ;; *) echo "unknown event type: $type" >&2; return 1 ;; esac
+	case "$type" in device|vpn|login|update|system|threat) ;; *) echo "unknown event type: $type" >&2; return 1 ;; esac
 	[ "$(cfg enabled)" = 1 ] || return 0
 	[ "$(cfg ntfy_enabled)" = 1 ] || [ "$(cfg email_enabled)" = 1 ] || return 0
 	[ "$(cfg "ev_$type")" = 0 ] && return 0

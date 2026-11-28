@@ -17,6 +17,7 @@ const EVENTS = [
 	[ 'device', 'New devices', 'A device joins your Wi-Fi or guest network for the first time.' ],
 	[ 'vpn', 'VPN', 'The VPN drops for more than a minute, and when it reconnects.' ],
 	[ 'login', 'Failed sign-ins', 'A wrong password is entered on this page or over SSH.' ],
+	[ 'threat', 'Blocked threats', 'Threat blocking (Security page) stopped a device from reaching a known botnet or malware server.' ],
 	[ 'update', 'Updates', 'A new Roam version is available, or the router was updated.' ],
 	[ 'system', 'Router restarts', 'The router started up, for example after a power cut.' ]
 ];

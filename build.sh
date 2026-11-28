@@ -153,13 +153,15 @@ PKGS=(
   https-dns-proxy luci-app-https-dns-proxy
   # Notifications by email (phone push uses the built-in wget):
   msmtp
+  # Threat and country blocking (Security page; Advanced › banIP):
+  banip luci-app-banip
 )
 [[ $MODE == x86test ]] && PKGS+=(kmod-mac80211-hwsim ip-full kmod-veth)
 # Container: the host's kernel and drivers are used, so no kernel modules/firmware/USB tools.
 if (( CONTAINER )); then
   PKGS=(luci luci-ssl -wpad-basic-mbedtls wpad-mbedtls wifi-scripts iwinfo iw
         luci-proto-wireguard wireguard-tools qrencode luci-app-openvpn openvpn-mbedtls
-        https-dns-proxy luci-app-https-dns-proxy msmtp)
+        https-dns-proxy luci-app-https-dns-proxy msmtp banip luci-app-banip)
 fi
 
 IBNAME="openwrt-imagebuilder-$VER-$TGTN.Linux-x86_64"

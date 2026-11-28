@@ -1,0 +1,6 @@
+#!/bin/sh
+# banIP must follow uplink and VPN changes (see /usr/libexec/roam/banip sync).
+case "$ACTION" in ifup|ifdown|ifupdate) ;; *) exit 0 ;; esac
+case "$INTERFACE" in wan|wan6|wwan|tether|tether_ios|wgclient|teleport) ;; *) exit 0 ;; esac
+[ "$(uci -q get banip.global.ban_enabled)" = 1 ] || exit 0
+( sleep 3; /usr/libexec/roam/banip sync ) </dev/null >/dev/null 2>&1 &
