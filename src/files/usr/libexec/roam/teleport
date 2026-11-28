@@ -1,0 +1,76 @@
+#!/bin/sh
+# UniFi Teleport helper (experimental).
+#   teleport run <iface> <client args...>   started by netifd (proto teleport): runs the
+#                                           client with its output in the system log
+#   teleport forget                         delete the saved session (pair again with a
+#                                           new invite)
+#   teleport log                            the client's recent log lines
+
+case "$1" in
+run)
+	shift; iface=$1; shift
+	# A client left over from an interrupted stop still holds the TUN interface.
+	pidf=/var/run/teleport-client.pid
+	old=$(cat $pidf 2>/dev/null)
+	if [ -n "$old" ] && grep -q teleport-client /proc/$old/cmdline 2>/dev/null; then
+		kill -TERM $old; n=0
+		while [ -d /proc/$old ] && [ $n -lt 10 ]; do sleep 1; n=$((n+1)); done
+		kill -KILL $old 2>/dev/null
+	fi
+	fifo=/var/run/teleport-$iface.log
+	rm -f "$fifo"; mkfifo -m 600 "$fifo"
+	logger -t teleport < "$fifo" &
+	pairing=""
+	for a in "$@"; do [ "$a" = --invite ] && pairing=1; done
+	start=$(date +%s)
+	TELEPORT_INTERFACE="$iface" /usr/sbin/teleport-client "$@" > "$fifo" 2>&1 &
+	pid=$!
+	echo $pid > $pidf
+	spid=""
+	stopping=""
+	trap 'stopping=1; kill -TERM $pid $spid 2>/dev/null' TERM INT
+	while kill -0 $pid 2>/dev/null; do wait $pid; rc=$?; done
+	rm -f "$fifo" $pidf
+	[ -n "$stopping" ] && exit ${rc:-1}
+
+	# netifd starts the interface again as soon as this exits: pace the retries, so a
+	# failing setup never floods the UniFi cloud with requests.
+	pause() { sleep "$1" & spid=$!; wait $spid; spid=""; }
+	if [ -n "$pairing" ] && [ ! -s /etc/teleport/session.json ]; then
+		# The invite was refused (used, expired, mistyped) or never answered. Retrying
+		# cannot help: wait here until a new invite is added (that restarts us).
+		logger -t teleport "pairing failed; add a new invite link"
+		while [ -z "$stopping" ]; do pause 3600; done
+		exit 1
+	fi
+	# The saved session was refused (the router was removed under Teleport in UniFi, or
+	# the gateway reset it): retrying cannot help. Keep it aside and wait for a new invite.
+	if [ -z "$pairing" ] && [ -s /etc/teleport/session.json ] &&
+	   grep -qE '"state":"error".*"error":"[^"]* 40[0134] ' /var/run/teleport.json 2>/dev/null; then
+		mv -f /etc/teleport/session.json /etc/teleport/session.refused
+		sed -i 's/"state":"error"/"state":"refused"/' /var/run/teleport.json
+		logger -t teleport "the UniFi gateway refused the saved session; add a new invite link"
+		/usr/libexec/roam/notify event vpn "UniFi Teleport needs a new invite" \
+			"Your UniFi gateway no longer accepts this router (it may have been removed under Teleport in UniFi). Create a new invitation in UniFi and add it on the router's VPN page." \
+			--priority 4 --tags warning --key "teleport refused" --cooldown 86400 >/dev/null 2>&1
+		while [ -z "$stopping" ]; do pause 3600; done
+		exit 1
+	fi
+	b=$(cat /var/run/teleport-backoff 2>/dev/null)
+	case "$b" in ''|*[!0-9]*) b=0 ;; esac
+	[ $(( $(date +%s) - start )) -ge 600 ] && b=0    # it had been working: retry soon
+	b=$(( b ? b * 2 : 15 )); [ $b -gt 300 ] && b=300
+	echo $b > /var/run/teleport-backoff
+	logger -t teleport "client stopped (exit ${rc:-?}); retrying in $b s"
+	pause $b
+	exit ${rc:-1}
+	;;
+forget)
+	rm -f /etc/teleport/session.json /etc/teleport/session.refused /var/run/teleport.json
+	;;
+log)
+	logread -e teleport | tail -n 60
+	;;
+*)
+	echo "usage: $0 run|forget|log" >&2; exit 1 ;;
+esac

@@ -1,0 +1,137 @@
+#!/bin/sh
+# Event watcher for Roam notifications (started by /etc/init.d/roam-notify).
+#   notifyd log    follow the system log: failed sign-ins (web page and SSH)
+#   notifyd poll   every 30 s: VPN lost/restored, new devices, queued retries;
+#                  once at start: router restarted / updated
+# Sending (and whether an event type is turned on) is decided by /usr/libexec/roam/notify.
+
+N=/usr/libexec/roam/notify
+KNOWN=/etc/roam/known-devices
+
+# ---- failed sign-ins ------------------------------------------------------------------
+watch_log() {
+	# (logread -e takes a basic regex without alternation: filter here instead)
+	logread -f | while read -r line; do
+		local ip what
+		case "$line" in
+			*"failed login on"*)
+				ip=${line##* from }; what="the router's web page" ;;
+			*"Bad password attempt"*|*"nonexistent user"*)
+				ip=${line##* from }; ip=${ip%:*}; what="SSH" ;;
+			*) continue ;;
+		esac
+		ip=$(echo "$ip" | tr -cd '0-9a-fA-F.:')
+		$N event login "Failed sign-in" \
+			"Someone at $ip entered a wrong password for $what. If this was not you, a device on your network may be trying to get into the router." \
+			--priority 4 --tags warning,lock --key "login $ip" --cooldown 900
+	done
+}
+
+# ---- VPN ------------------------------------------------------------------------------
+# Prints the active VPN and its state: "<name> up|down", or "none".
+vpn_state() {
+	local hs now
+	if [ "$(uci -q get network.teleport.proto)" = teleport ] && [ "$(uci -q get network.teleport.disabled)" != 1 ]; then
+		grep -q '"state":"connected"' /tmp/run/teleport.json 2>/dev/null && echo "UniFi Teleport up" || echo "UniFi Teleport down"
+		return
+	fi
+	if [ "$(uci -q get network.wgclient.proto)" = wireguard ] && [ "$(uci -q get network.wgclient.disabled)" != 1 ]; then
+		hs=$(wg show wgclient latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+		now=$(date +%s)
+		[ -n "$hs" ] && [ "$hs" -gt 0 ] && [ $((now - hs)) -lt 200 ] && echo "WireGuard up" || echo "WireGuard down"
+		return
+	fi
+	echo none
+}
+
+# ---- devices --------------------------------------------------------------------------
+net_of() {   # which of our networks an address is in
+	local ip=$1 n a
+	for n in lan guest; do
+		a=$(uci -q get network.$n.ipaddr)
+		[ -n "$a" ] && [ "${ip%.*}" = "${a%.*}" ] && { [ $n = lan ] && echo "main network" || echo "guest network"; return; }
+	done
+	echo "network"
+}
+
+check_devices() {
+	[ -f /tmp/dhcp.leases ] || return
+	mkdir -p /etc/roam
+	if [ ! -f $KNOWN ]; then
+		# First run: everything already here is known; only later arrivals are reported.
+		awk '{print tolower($2)}' /tmp/dhcp.leases | sort -u > $KNOWN
+		return
+	fi
+	local exp mac ip name rest
+	while read -r exp mac ip name rest; do
+		mac=$(echo "$mac" | tr 'A-F' 'a-f')
+		echo "$mac" | grep -qE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' || continue
+		grep -qxF "$mac" $KNOWN && continue
+		echo "$mac" >> $KNOWN
+		[ "$name" = "*" ] && name="An unnamed device"
+		name=$(printf '%s' "$name" | tr -cd 'A-Za-z0-9._ -' | cut -c1-40)
+		$N event device "New device joined" \
+			"${name:-A device} ($ip, $mac) joined the $(net_of "$ip") for the first time." \
+			--priority 3 --tags new --key "device $mac" --cooldown 86400
+	done < /tmp/dhcp.leases
+}
+
+# ---- once at start ----------------------------------------------------------------------
+at_start() {
+	local ver seen up
+	ver=$(sed -n 's/^ROAM_VERSION=//p' /etc/roam-release 2>/dev/null)
+	seen=$(uci -q get roam.notify.seen_version)
+	if [ -n "$ver" ] && [ "$ver" != "$seen" ]; then
+		uci -q get roam.notify >/dev/null || uci set roam.notify=notify
+		uci set roam.notify.seen_version="$ver"; uci commit roam
+		[ -n "$seen" ] && $N event update "Router updated" "Roam was updated from $seen to $ver." \
+			--priority 2 --tags arrows_counterclockwise --once "updated $ver"
+		return
+	fi
+	up=$(cut -d. -f1 /proc/uptime)
+	[ "$up" -lt 600 ] && $N event system "Router restarted" \
+		"The router started up (for example after a power cut or a restart)." --priority 2 --tags electric_plug
+}
+
+poll() {
+	local cur prev="" since=0 lost="" now name
+	sleep 20   # let the network settle after a start
+	at_start
+	while :; do
+		now=$(date +%s)
+		cur=$(vpn_state)
+		name=${cur% *}
+		case "$cur" in
+			*" up")
+				if [ -n "$lost" ]; then
+					$N event vpn "VPN reconnected" "$name is connected again after $(( (now - lost + 59) / 60 )) min. Your devices are protected again." \
+						--priority 3 --tags white_check_mark --key "vpn restored" --cooldown 60
+					lost=""
+				fi
+				since=0 ;;
+			*" down")
+				[ "$prev" = "$cur" ] || since=$now
+				# Debounced: report only if it stays down for a minute (renegotiations are shorter).
+				if [ -z "$lost" ] && [ $since -gt 0 ] && [ $((now - since)) -ge 60 ]; then
+					if [ "$(uci -q get roam.main.killswitch)" = 1 ]; then
+						msg="$name is not connected. The kill switch is on, so your devices are offline until it reconnects."
+					else
+						msg="$name is not connected. Until it reconnects, your devices are offline or not protected by the VPN. Turn on the kill switch (VPN page) so they are never unprotected."
+					fi
+					$N event vpn "VPN connection lost" "$msg" --priority 4 --tags warning --key "vpn lost" --cooldown 600
+					lost=$since
+				fi ;;
+			*) lost=""; since=0 ;;   # no VPN in use (or turned off on purpose)
+		esac
+		prev=$cur
+		check_devices
+		[ -n "$(ls /tmp/roam-notify/queue 2>/dev/null)" ] && $N flush
+		sleep 30
+	done
+}
+
+case "$1" in
+	log) watch_log ;;
+	poll) poll ;;
+	*) echo "usage: $0 log|poll" >&2; exit 1 ;;
+esac

@@ -1,0 +1,95 @@
+#!/bin/sh
+# Tunnel events from teleport-client (see /lib/netifd/proto/teleport.sh).
+#
+# Routing: everything the router sends or forwards uses table 5450 (default route into
+# the tunnel), except the client's own marked sockets (0x5450) and more specific routes
+# of the main table (LAN, guest, the uplink's own subnet). The main table's default
+# route is ignored ("suppress_prefixlength 0"). IPv6 to the Internet is blocked while
+# the tunnel is in use (the tunnel carries IPv4), so nothing leaks around it.
+
+. /lib/functions.sh
+. /lib/netifd/netifd-proto.sh
+
+IFACE=${TELEPORT_INTERFACE:-teleport}
+DEV=${TELEPORT_IFNAME:-teleport}
+MARK=0x5450
+TABLE=5450
+
+rules_del() {
+	for f in -4 -6; do
+		while ip $f rule del pref 5440 2>/dev/null; do :; done
+		while ip $f rule del pref 5441 2>/dev/null; do :; done
+	done
+}
+# Routes on the tunnel device. Also re-applied from /etc/hotplug.d/iface (netifd resets
+# the device's routes while it takes the interface up) and on "connected".
+routes_add() {
+	[ -n "$TELEPORT_DNS" ] || TELEPORT_DNS=$(cat /var/run/teleport.dns 2>/dev/null)
+	ip link show dev "$DEV" >/dev/null 2>&1 || return 0
+	ip route replace default dev "$DEV" table $TABLE
+	ip -6 route replace unreachable default table $TABLE
+	# The tunnel's DNS servers are home-network addresses; make sure a hotel network
+	# that uses the same subnet cannot capture them.
+	for a in $TELEPORT_DNS; do
+		case "$a" in *:*|'') ;; *) ip route replace "$a/32" dev "$DEV" ;; esac
+	done
+}
+rules_add() {
+	for f in -4 -6; do
+		ip $f rule add pref 5440 lookup main suppress_prefixlength 0
+		ip $f rule add pref 5441 not fwmark $MARK lookup $TABLE
+	done
+}
+
+case "$1" in
+up)
+	# TELEPORT_IP: IPv4 address (/32); TELEPORT_IP6/_MASK: the tunnel's IPv6 address and
+	# prefix, used to reach the console's health-check echo server.
+	m6=${TELEPORT_IP6_MASK:-128}
+	case "$m6" in ''|*[!0-9]*) m6=128 ;; esac
+	[ "$m6" -ge 64 ] && [ "$m6" -le 128 ] || m6=128
+	ip link set dev "$DEV" up
+	ip -4 addr flush dev "$DEV"
+	ip -6 addr flush dev "$DEV" scope global
+	ip addr add "$TELEPORT_IP/32" dev "$DEV"
+	[ -n "$TELEPORT_IP6" ] && ip -6 addr add "$TELEPORT_IP6/$m6" dev "$DEV" nodad
+	echo "$TELEPORT_DNS" > /var/run/teleport.dns
+	routes_add
+	rules_del
+	rules_add
+	proto_init_update "$DEV" 1
+	proto_add_ipv4_address "$TELEPORT_IP" 32
+	[ -n "$TELEPORT_IP6" ] && proto_add_ipv6_address "$TELEPORT_IP6" "$m6"
+	for a in $TELEPORT_DNS; do proto_add_dns_server "$a"; done
+	proto_send_update "$IFACE"
+	logger -t teleport "tunnel up: $TELEPORT_IP via $TELEPORT_ENDPOINT${TELEPORT_CONSOLE:+ to $TELEPORT_CONSOLE}"
+	;;
+paired)
+	# Invite links work once; the saved session replaces it.
+	if [ -n "$(uci -q get network.$IFACE.invite)" ]; then
+		uci -q delete network.$IFACE.invite
+		uci commit network
+	fi
+	logger -t teleport "paired${TELEPORT_CONSOLE:+ with $TELEPORT_CONSOLE}"
+	/usr/libexec/roam/notify event vpn "UniFi Teleport paired" \
+		"The router is now paired with ${TELEPORT_CONSOLE:-your UniFi gateway}. It appears in UniFi under Teleport, where you can remove it." \
+		--priority 3 --tags link --once "teleport paired $(date +%s)" >/dev/null 2>&1
+	;;
+connected)
+	routes_add
+	logger -t teleport "$1"
+	;;
+routes)
+	routes_add
+	;;
+unhealthy|reconnecting)
+	logger -t teleport "$1"
+	;;
+down)
+	rules_del
+	ip route flush table $TABLE 2>/dev/null
+	ip -6 route flush table $TABLE 2>/dev/null
+	rm -f /var/run/teleport.dns
+	;;
+esac
+exit 0

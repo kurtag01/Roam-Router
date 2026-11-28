@@ -1,0 +1,680 @@
+diff --git a/main.go b/main.go
+index 1eeb5b5..d506c1d 100644
+--- a/main.go
++++ b/main.go
+@@ -26,6 +26,9 @@ var (
+ // request/poll/delete cycle uses once past the initial ACCESS_GRANTED wait.
+ const responsePollInterval = 600 * time.Millisecond
+ 
++// Roam flags (see roamtun_linux.go).
++var roamTunFlag, roamFwmarkFlag, roamDNSFlag, roamHookFlag, roamStatusFlag string
++
+ // cliFlags holds the parsed and validated command-line configuration.
+ type cliFlags struct {
+ 	invite               string
+@@ -56,6 +59,8 @@ type sessionResult struct {
+ func main() {
+ 	flags := parseFlags()
+ 	appLog = newAppLogger(os.Stderr, flags.debug)
++	roamFlags(&roamTunFlag, &roamFwmarkFlag, &roamDNSFlag, &roamHookFlag, &roamStatusFlag)
++	defer roamClose()
+ 	if cpuProfile := os.Getenv("TELEPORT_CPUPROFILE"); cpuProfile != "" {
+ 		f, err := os.Create(cpuProfile)
+ 		if err != nil {
+@@ -75,8 +80,11 @@ func main() {
+ 
+ 	if err := runClient(ctx, flags); err != nil && !errors.Is(err, context.Canceled) {
+ 		appLog.Error("fatal error", "error", err)
++		roamState("error", err.Error())
++		roamClose()
+ 		os.Exit(1)
+ 	}
++	roamState("stopped", "")
+ 	appLog.Info("Teleport client stopped")
+ }
+ 
+@@ -90,6 +98,7 @@ func runClient(ctx context.Context, flags cliFlags) error {
+ 		if err := ctx.Err(); err != nil {
+ 			return err
+ 		}
++		roamState("connecting", "")
+ 		result, err := runConnectionAttempt(ctx, flags, &session, attempt)
+ 		if result.printedConfig {
+ 			return nil
+@@ -215,6 +224,7 @@ func runConnectionAttempt(ctx context.Context, flags cliFlags, session *sessionR
+ 		candidateTypes:       candidateTypes,
+ 		mtu:                  flags.mtu,
+ 		tcpCongestionControl: flags.tcpCongestionControl,
++		endpointMode:         endpointMode,
+ 	})
+ 	return connectionAttemptResult{
+ 		tunnelStarted:  true,
+@@ -269,6 +279,11 @@ func parseFlags() cliFlags {
+ 	debug := flag.Bool("debug", false, "enable debug logging")
+ 	sessionFile := flag.String("session-file", "sessions/teleport-session.json", "read or save the session file")
+ 	mtu := flag.Int("mtu", 0, "set the tunnel MTU (1280-1500; defaults to auto-discovery or TELEPORT_MTU)")
++	flag.StringVar(&roamTunFlag, "tun", "", "Roam: use a kernel TUN interface with this name (no SOCKS5 proxy)")
++	flag.StringVar(&roamFwmarkFlag, "fwmark", "", "Roam: firewall mark for the client's own sockets")
++	flag.StringVar(&roamDNSFlag, "dns", "", "Roam: DNS server for the client's own lookups")
++	flag.StringVar(&roamHookFlag, "hook", "", "Roam: program run on tunnel events")
++	flag.StringVar(&roamStatusFlag, "status", "", "Roam: JSON status file")
+ 	flag.Usage = func() {
+ 		out := flag.CommandLine.Output()
+ 		fmt.Fprintln(out, "teleport-client "+version)
+@@ -413,6 +428,11 @@ func establishSession(ctx context.Context, flags cliFlags) (sessionResult, error
+ 			return sessionResult{}, fmt.Errorf("no --invite given and failed to load session from %s: %w (run once with --invite to pair)", flags.sessionFile, err)
+ 		}
+ 		appLog.Info("reusing session", "path", flags.sessionFile, "saved_at", sess.SavedAt.Format(time.RFC3339))
++		if roamKernelTun != nil {
++			if md, err := fetchMetadataContext(ctx, sess.SessionToken); err == nil {
++				roamConsoleName.Store(md.Metadata.Name)
++			}
++		}
+ 		return sessionResult{Token: sess.SessionToken, Secret: sess.SessionSecret}, nil
+ 	}
+ 
+@@ -446,6 +466,7 @@ func establishSession(ctx context.Context, flags cliFlags) (sessionResult, error
+ 
+ 	if md, err := fetchMetadataContext(ctx, sessionToken); err == nil {
+ 		appLog.Info("console metadata", "name", md.Metadata.Name, "wan_ip", md.Metadata.WanIP)
++		roamConsoleName.Store(md.Metadata.Name)
+ 	} else {
+ 		appLog.Warn("console metadata unavailable", "error", err)
+ 	}
+@@ -462,6 +483,7 @@ func establishSession(ctx context.Context, flags cliFlags) (sessionResult, error
+ 			appLog.Warn("failed to save session", "path", flags.sessionFile, "error", err)
+ 		} else {
+ 			appLog.Info("session saved", "path", flags.sessionFile)
++			roamHook("paired")
+ 		}
+ 	}
+ 
+diff --git a/nomination.go b/nomination.go
+index 38ffa4c..3c7dbef 100644
+--- a/nomination.go
++++ b/nomination.go
+@@ -59,7 +59,7 @@ func localCandidates(port int, family networkFamily) []candidate {
+ 	seen := map[string]bool{}
+ 	var out []candidate
+ 	for _, iface := range ifaces {
+-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
++		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || roamSkipInterface(iface.Name) {
+ 			continue
+ 		}
+ 		addrs, _ := iface.Addrs()
+diff --git a/roamtun_linux.go b/roamtun_linux.go
+new file mode 100644
+index 0000000..a8c995c
+--- /dev/null
++++ b/roamtun_linux.go
+@@ -0,0 +1,372 @@
++//go:build linux
++
++package main
++
++// Roam router additions (OpenWrt):
++//
++//   --tun <name>     carry the tunnel on a kernel TUN interface instead of the userspace
++//                    netstack + SOCKS5 proxy, so the router can route its LAN through it.
++//                    The interface lives as long as the process: renegotiations reuse it,
++//                    so traffic waits in the tunnel instead of leaking out the uplink.
++//   --fwmark <n>     mark the client's own sockets (Teleport API, STUN, WireGuard UDP),
++//                    so policy routing sends them out the uplink, not into the tunnel.
++//   --dns <ip>       resolve the client's own hostnames with this server (marked socket),
++//                    independent of the router's DNS (which points into the tunnel).
++//   --hook <path>    run "<path> <event>" with TELEPORT_* variables: up, connected,
++//                    unhealthy, reconnecting, paired.
++//   --status <path>  JSON status file (state, console name, endpoint, last error).
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net"
++	"net/http"
++	"os"
++	"os/exec"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"time"
++
++	"golang.zx2c4.com/wireguard/tun"
++)
++
++var (
++	roamFwmark      int
++	roamHookPath    string
++	roamStatusPath  string
++	roamKernelTun   *roamTun
++	roamConsoleName atomic.Value // string
++	roamTunnelEnv   atomic.Value // []string: TELEPORT_* of the current tunnel
++)
++
++func roamFlags(tunName, fwmark, dns, hook, status *string) {
++	if *fwmark != "" {
++		v, err := strconv.ParseInt(*fwmark, 0, 32)
++		if err != nil || v <= 0 {
++			fmt.Fprintln(os.Stderr, "error: --fwmark must be a positive number (e.g. 0x5450)")
++			os.Exit(2)
++		}
++		roamFwmark = int(v)
++		d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, Control: roamMarkControl}
++		t := http.DefaultTransport.(*http.Transport).Clone()
++		t.DialContext = d.DialContext
++		http.DefaultTransport = t
++	}
++	if *dns != "" {
++		server := *dns
++		if _, _, err := net.SplitHostPort(server); err != nil {
++			server = net.JoinHostPort(server, "53")
++		}
++		net.DefaultResolver = &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
++			d := net.Dialer{Timeout: 5 * time.Second, Control: roamMarkControl}
++			return d.DialContext(ctx, network, server)
++		}}
++	}
++	roamHookPath, roamStatusPath = *hook, *status
++	roamConsoleName.Store("")
++	roamTunnelEnv.Store([]string(nil))
++	if *tunName != "" {
++		t, err := openRoamTun(*tunName, baseTunnelMTU)
++		if err != nil {
++			fmt.Fprintf(os.Stderr, "error: cannot create TUN interface %q: %v\n", *tunName, err)
++			os.Exit(1)
++		}
++		roamKernelTun = t
++	}
++}
++
++func roamClose() {
++	if roamKernelTun != nil {
++		_ = roamKernelTun.dev.Close()
++	}
++}
++
++// roamMarkControl sets SO_MARK on a socket before it binds/connects.
++func roamMarkControl(_, _ string, c syscall.RawConn) error {
++	if roamFwmark == 0 {
++		return nil
++	}
++	var serr error
++	if err := c.Control(func(fd uintptr) {
++		serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, roamFwmark)
++	}); err != nil {
++		return err
++	}
++	return serr
++}
++
++func roamListenUDP(network string, addr *net.UDPAddr) (*net.UDPConn, error) {
++	lc := net.ListenConfig{Control: roamMarkControl}
++	pc, err := lc.ListenPacket(context.Background(), network, addr.String())
++	if err != nil {
++		return nil, err
++	}
++	return pc.(*net.UDPConn), nil
++}
++
++func roamDialUDP(endpoint *net.UDPAddr) (*net.UDPConn, error) {
++	d := net.Dialer{Control: roamMarkControl}
++	c, err := d.Dial("udp", endpoint.String())
++	if err != nil {
++		return nil, err
++	}
++	return c.(*net.UDPConn), nil
++}
++
++func roamRouteGetArgs(ip string) []string {
++	if roamFwmark != 0 {
++		return []string{"route", "get", ip, "mark", strconv.Itoa(roamFwmark)}
++	}
++	return []string{"route", "get", ip}
++}
++
++func roamSkipInterface(name string) bool {
++	if roamKernelTun != nil && name == roamKernelTun.name {
++		return true
++	}
++	return false
++}
++
++// ---- hook and status ----
++
++type roamStatus struct {
++	State     string `json:"state"`
++	Console   string `json:"console,omitempty"`
++	Endpoint  string `json:"endpoint,omitempty"`
++	Mode      string `json:"mode,omitempty"`
++	ClientIP  string `json:"client_ip,omitempty"`
++	Error     string `json:"error,omitempty"`
++	Updated   int64  `json:"updated"`
++	Connected int64  `json:"connected,omitempty"`
++}
++
++var (
++	roamStatusMu sync.Mutex
++	roamCur      roamStatus
++)
++
++func roamSetStatus(update func(s *roamStatus)) {
++	roamStatusMu.Lock()
++	defer roamStatusMu.Unlock()
++	update(&roamCur)
++	roamCur.Console, _ = roamConsoleName.Load().(string)
++	roamCur.Updated = time.Now().Unix()
++	if roamStatusPath == "" {
++		return
++	}
++	data, err := json.Marshal(roamCur)
++	if err != nil {
++		return
++	}
++	tmp := roamStatusPath + ".tmp"
++	if os.WriteFile(tmp, append(data, '\n'), 0o644) == nil {
++		_ = os.Rename(tmp, roamStatusPath)
++	}
++}
++
++func roamState(state, errText string) {
++	roamSetStatus(func(s *roamStatus) {
++		s.State, s.Error = state, errText
++		if state == "connected" {
++			s.Connected = time.Now().Unix()
++		} else if state != "unhealthy" {
++			s.Connected = 0
++		}
++	})
++}
++
++func roamHook(event string) {
++	if roamHookPath == "" {
++		return
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, roamHookPath, event)
++	env := append(os.Environ(), "TELEPORT_CONSOLE="+oneLine(roamConsoleName.Load().(string)))
++	if t := roamTunnelEnv.Load().([]string); t != nil {
++		env = append(env, t...)
++	}
++	cmd.Env = env
++	out, err := cmd.CombinedOutput()
++	if err != nil {
++		appLog.Warn("hook failed", "event", event, "error", err, "output", strings.TrimSpace(string(out)))
++	}
++}
++
++func oneLine(s string) string {
++	return strings.Map(func(r rune) rune {
++		if r < 0x20 || r == 0x7f {
++			return ' '
++		}
++		return r
++	}, s)
++}
++
++// roamTunnelUp records the tunnel's addresses and runs the "up" hook, which configures
++// the interface, routes and rules before traffic starts.
++func roamTunnelUp(p tunnelParams, endpoint, mode string, mtu int) {
++	info := p.connResp.ServerInfo
++	env := []string{
++		"TELEPORT_IFNAME=" + roamKernelTun.name,
++		"TELEPORT_IP=" + p.connResp.ClientIP,
++		// tunnel_addr/tunnel_mask: the router's own IPv6 address inside the tunnel
++		// (the console's UDP echo server is on that prefix).
++		"TELEPORT_IP6=" + info.TunnelAddr,
++		"TELEPORT_IP6_MASK=" + strconv.Itoa(info.TunnelMask),
++		"TELEPORT_DNS=" + strings.Join(p.connResp.DNSAddrs, " "),
++		"TELEPORT_MTU=" + strconv.Itoa(mtu),
++		"TELEPORT_ENDPOINT=" + endpoint,
++		"TELEPORT_MODE=" + mode,
++	}
++	roamTunnelEnv.Store(env)
++	roamSetStatus(func(s *roamStatus) {
++		s.Endpoint, s.Mode, s.ClientIP = endpoint, mode, p.connResp.ClientIP
++	})
++	roamState("handshake", "")
++	roamHook("up")
++}
++
++// ---- kernel TUN that outlives individual WireGuard devices ----
++
++type roamTun struct {
++	dev  tun.Device
++	name string
++	mu   sync.Mutex
++	view *roamTunView
++}
++
++func openRoamTun(name string, mtu int) (*roamTun, error) {
++	dev, err := tun.CreateTUN(name, mtu)
++	if err != nil {
++		return nil, err
++	}
++	real, err := dev.Name()
++	if err != nil {
++		_ = dev.Close()
++		return nil, err
++	}
++	t := &roamTun{dev: dev, name: real}
++	// The kernel device's own events are not needed: wireguard-go is brought up
++	// explicitly, and MTU changes are announced by SetMTU.
++	go func() {
++		for range dev.Events() {
++		}
++	}()
++	return t, nil
++}
++
++// newView hands one WireGuard device a handle on the interface. Closing the view
++// detaches that device; the interface itself stays.
++func (t *roamTun) newView() *roamTunView {
++	_ = t.dev.File().SetReadDeadline(time.Time{})
++	v := &roamTunView{t: t, events: make(chan tun.Event, 4)}
++	t.mu.Lock()
++	t.view = v
++	t.mu.Unlock()
++	return v
++}
++
++func (t *roamTun) SetMTU(mtu int) error {
++	if out, err := exec.Command("ip", "link", "set", "dev", t.name, "mtu", strconv.Itoa(mtu)).CombinedOutput(); err != nil {
++		return fmt.Errorf("ip link set mtu %d: %v: %s", mtu, err, strings.TrimSpace(string(out)))
++	}
++	t.mu.Lock()
++	v := t.view
++	t.mu.Unlock()
++	if v != nil {
++		v.notify(tun.EventMTUUpdate)
++	}
++	return nil
++}
++
++type roamTunView struct {
++	t      *roamTun
++	closed atomic.Bool
++	mu     sync.Mutex
++	events chan tun.Event
++}
++
++func (v *roamTunView) notify(e tun.Event) {
++	v.mu.Lock()
++	defer v.mu.Unlock()
++	if v.closed.Load() {
++		return
++	}
++	select {
++	case v.events <- e:
++	default:
++	}
++}
++
++func (v *roamTunView) File() *os.File { return v.t.dev.File() }
++
++func (v *roamTunView) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
++	if v.closed.Load() {
++		return 0, os.ErrClosed
++	}
++	n, err := v.t.dev.Read(bufs, sizes, offset)
++	if v.closed.Load() || errors.Is(err, os.ErrDeadlineExceeded) {
++		return 0, os.ErrClosed // read after detach (at most one batch is lost)
++	}
++	return n, err
++}
++
++func (v *roamTunView) Write(bufs [][]byte, offset int) (int, error) {
++	if v.closed.Load() {
++		return 0, os.ErrClosed
++	}
++	return v.t.dev.Write(bufs, offset)
++}
++
++func (v *roamTunView) MTU() (int, error)        { return v.t.dev.MTU() }
++func (v *roamTunView) Name() (string, error)    { return v.t.name, nil }
++func (v *roamTunView) Events() <-chan tun.Event { return v.events }
++func (v *roamTunView) BatchSize() int           { return v.t.dev.BatchSize() }
++
++func (v *roamTunView) Close() error {
++	v.mu.Lock()
++	defer v.mu.Unlock()
++	if v.closed.Swap(true) {
++		return nil
++	}
++	// WireGuard's device.Close waits for its reader, which sits in read() on the
++	// kernel TUN: wake it (the TUN fd is non-blocking, so deadlines work).
++	_ = v.t.dev.File().SetReadDeadline(time.Now())
++	close(v.events)
++	return nil
++}
++
++// ---- UDP echo (tunnel health) over the kernel interface ----
++
++type kernelEcho struct {
++	t      *roamTun
++	local4 net.IP // client_ip
++	local6 net.IP // tunnel_addr
++}
++
++func (k kernelEcho) DialUDP(raddr *net.UDPAddr) (net.Conn, error) {
++	d := net.Dialer{Control: func(_, _ string, c syscall.RawConn) error {
++		var serr error
++		if err := c.Control(func(fd uintptr) {
++			serr = syscall.BindToDevice(int(fd), k.t.name)
++		}); err != nil {
++			return err
++		}
++		return serr
++	}}
++	local := k.local4
++	if raddr.IP.To4() == nil {
++		local = k.local6
++	}
++	if local != nil {
++		d.LocalAddr = &net.UDPAddr{IP: local}
++	}
++	return d.Dial("udp", raddr.String())
++}
++
++func (k kernelEcho) SetMTU(mtu int) error { return k.t.SetMTU(mtu) }
+diff --git a/tunnel.go b/tunnel.go
+index 8b2c671..e08341a 100644
+--- a/tunnel.go
++++ b/tunnel.go
+@@ -13,6 +13,7 @@ import (
+ 
+ 	"github.com/sinnet3000/teleport-client/internal/tunnet"
+ 	"golang.zx2c4.com/wireguard/device"
++	"golang.zx2c4.com/wireguard/tun"
+ )
+ 
+ // tunnelParams collects everything runTunnel needs to bring the WireGuard
+@@ -32,6 +33,7 @@ type tunnelParams struct {
+ 	candidateTypes       map[string]string
+ 	mtu                  int
+ 	tcpCongestionControl string
++	endpointMode         string
+ }
+ 
+ const (
+@@ -125,13 +127,26 @@ func runTunnel(ctx context.Context, p tunnelParams) error {
+ 		tunOpts = append(tunOpts, tunnet.WithCongestionControl(p.tcpCongestionControl))
+ 		appLog.Info("TCP congestion control override requested", "cc", p.tcpCongestionControl)
+ 	}
+-	tun, tunnelNet, err := tunnet.CreateNetTUN(deviceAddrs, dnsAddrs, initialMTU, tunOpts...)
+-	if err != nil {
+-		return err
++	var tunDev tun.Device
++	var tunnelNet *tunnet.Net
++	var echo echoNet
++	if roamKernelTun != nil {
++		// Roam (--tun): the kernel interface; the hook configures addresses and routes.
++		tunDev = roamKernelTun.newView()
++		echo = kernelEcho{t: roamKernelTun, local4: net.ParseIP(p.connResp.ClientIP), local6: net.ParseIP(p.connResp.ServerInfo.TunnelAddr)}
++		if err := roamKernelTun.SetMTU(initialMTU); err != nil {
++			appLog.Warn("setting tunnel MTU failed", "error", err)
++		}
++	} else {
++		tunDev, tunnelNet, err = tunnet.CreateNetTUN(deviceAddrs, dnsAddrs, initialMTU, tunOpts...)
++		if err != nil {
++			return err
++		}
++		echo = netstackEcho{tunnelNet}
+ 	}
+ 
+ 	bind := &stunBind{conn4: p.sockets.V4, conn6: p.sockets.V6, stunSecret: p.stunSecret, nomination: p.nomination}
+-	dev := device.NewDevice(tun, bind, newWireGuardLogger(appLog, p.debug))
++	dev := device.NewDevice(tunDev, bind, newWireGuardLogger(appLog, p.debug))
+ 	defer dev.Close()
+ 	var workerWG sync.WaitGroup
+ 	defer func() {
+@@ -148,6 +163,10 @@ func runTunnel(ctx context.Context, p tunnelParams) error {
+ 		return err
+ 	}
+ 	appLog.Debug("WireGuard device started", "endpoint", p.endpoint)
++	if roamKernelTun != nil {
++		roamTunnelUp(p, p.endpoint, p.endpointMode, initialMTU)
++		defer roamHook("reconnecting")
++	}
+ 	renegotiate := make(chan struct{}, 1)
+ 	workerWG.Add(1)
+ 	go func() {
+@@ -160,15 +179,18 @@ func runTunnel(ctx context.Context, p tunnelParams) error {
+ 	workerWG.Add(1)
+ 	go func() {
+ 		defer workerWG.Done()
+-		if err := runUDPEchoPinger(lifecycleCtx, tunnelNet, p.stunSecret, p.connResp.ServerInfo, healthEvents, prober); err != nil {
++		if err := runUDPEchoPinger(lifecycleCtx, echo, p.stunSecret, p.connResp.ServerInfo, healthEvents, prober); err != nil {
+ 			echoStopped <- err
+ 		}
+ 	}()
+-	proxy, err := startSocks5Proxy(p.socks5Addr, p.socks5Auth, tunnelNet)
+-	if err != nil {
+-		return err
++	if roamKernelTun == nil {
++		proxy, err := startSocks5Proxy(p.socks5Addr, p.socks5Auth, tunnelNet)
++		if err != nil {
++			return err
++		}
++		defer proxy.Close()
+ 	}
+-	defer proxy.Close()
++	connectedReported := false
+ 
+ 	knownEndpoints := append([]string{p.endpoint}, p.candidateQueue...)
+ 	baseline := readWireGuardPeerStats(dev)
+@@ -197,6 +219,11 @@ func runTunnel(ctx context.Context, p tunnelParams) error {
+ 			switch event {
+ 			case udpEchoHealthy:
+ 				baseline = current
++				if roamKernelTun != nil && !connectedReported {
++					connectedReported = true
++					roamState("connected", "")
++					roamHook("connected")
++				}
+ 				if recoveryCancel != nil {
+ 					recoveryCancel()
+ 					recoveryCancel = nil
+@@ -206,11 +233,24 @@ func runTunnel(ctx context.Context, p tunnelParams) error {
+ 				appLog.Warn("WireGuard startup endpoints exhausted; requesting fresh Teleport negotiation")
+ 				return errTunnelRenegotiationRequired
+ 			case udpEchoUnhealthy:
+-				if wireGuardPathActiveSince(baseline, current, time.Now()) {
++				// Roam: the console keeps sending handshake initiations after it has
++				// dropped the session, which looks like an active path; trust the echo.
++				// If endpoint recovery has not helped by the next unhealthy report
++				// (about a minute), negotiate again through the Teleport cloud.
++				if roamKernelTun != nil && recoveryCancel != nil {
++					appLog.Warn("WireGuard tunnel still unhealthy after endpoint recovery; renegotiating")
++					return errTunnelRenegotiationRequired
++				}
++				if roamKernelTun == nil && wireGuardPathActiveSince(baseline, current, time.Now()) {
+ 					appLog.Warn("UDP echo health probe unavailable while WireGuard remains active; keeping tunnel up")
+ 					baseline = current
+ 					continue
+ 				}
++				if roamKernelTun != nil && connectedReported {
++					connectedReported = false
++					roamState("unhealthy", "")
++					roamHook("unhealthy")
++				}
+ 				if recoveryCancel == nil {
+ 					appLog.Warn("WireGuard tunnel unhealthy; starting automatic endpoint recovery")
+ 					recoveryCancel = startWireGuardEndpointRecovery(lifecycleCtx, &workerWG, dev, peerPubHex, current.endpoint, knownEndpoints, p.sockets, p.stunSecret, renegotiate)
+diff --git a/udpecho.go b/udpecho.go
+index 615c042..6b3ec3f 100644
+--- a/udpecho.go
++++ b/udpecho.go
+@@ -95,7 +95,19 @@ func (s *udpEchoStats) logAndReset(now time.Time) {
+ 
+ // runUDPEchoPinger sends Teleport's post-activation quality probe through the
+ // WireGuard netstack to the server-provided UDP echo endpoint.
+-func runUDPEchoPinger(ctx context.Context, tunnelNet *tunnet.Net, secret string, info serverInfo, healthEvents chan<- udpEchoHealthEvent, prober *peerMTUProber) error {
++// echoNet is what the UDP echo pinger needs from the tunnel: the userspace netstack,
++// or (Roam, --tun) the kernel interface.
++type echoNet interface {
++	DialUDP(raddr *net.UDPAddr) (net.Conn, error)
++	SetMTU(mtu int) error
++}
++
++type netstackEcho struct{ n *tunnet.Net }
++
++func (e netstackEcho) DialUDP(raddr *net.UDPAddr) (net.Conn, error) { return e.n.DialUDP(nil, raddr) }
++func (e netstackEcho) SetMTU(mtu int) error                         { return e.n.SetMTU(mtu) }
++
++func runUDPEchoPinger(ctx context.Context, tunnelNet echoNet, secret string, info serverInfo, healthEvents chan<- udpEchoHealthEvent, prober *peerMTUProber) error {
+ 	if tunnelNet == nil || info.UDPEchoAddr == "" || info.UDPEchoPort == 0 {
+ 		appLog.Warn("UDP echo unavailable", "reason", "server supplied no echo endpoint")
+ 		return nil
+@@ -105,7 +117,7 @@ func runUDPEchoPinger(ctx context.Context, tunnelNet *tunnet.Net, secret string,
+ 	if remote.IP == nil {
+ 		return fmt.Errorf("invalid UDP echo endpoint %q", info.UDPEchoAddr)
+ 	}
+-	conn, err := tunnelNet.DialUDP(nil, remote)
++	conn, err := tunnelNet.DialUDP(remote)
+ 	if err != nil {
+ 		return fmt.Errorf("dial UDP echo endpoint %s: %w", remote, err)
+ 	}
+diff --git a/wireguard.go b/wireguard.go
+index 98f1ac5..2e0aa92 100644
+--- a/wireguard.go
++++ b/wireguard.go
+@@ -52,7 +52,7 @@ func openUDPSockets(port int, family networkFamily) (*udpSockets, error) {
+ 	var v4, v6 *net.UDPConn
+ 	var err error
+ 	if family != familyIPv6 {
+-		v4, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
++		v4, err = roamListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
+ 		if err != nil {
+ 			if family == familyIPv4 {
+ 				return nil, err
+@@ -61,7 +61,7 @@ func openUDPSockets(port int, family networkFamily) (*udpSockets, error) {
+ 		}
+ 	}
+ 	if family != familyIPv4 {
+-		v6, err = net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6zero, Port: port})
++		v6, err = roamListenUDP("udp6", &net.UDPAddr{IP: net.IPv6zero, Port: port})
+ 		if err != nil {
+ 			if family == familyIPv6 {
+ 				if v4 != nil {
+@@ -420,7 +420,7 @@ func queryRouteMTU(ctx context.Context, ip net.IP) int {
+ 			return parseDarwinRouteMTU(string(out))
+ 		}
+ 	case "linux":
+-		out, err := exec.CommandContext(cmdCtx, "ip", "route", "get", ipStr).Output()
++		out, err := exec.CommandContext(cmdCtx, "ip", roamRouteGetArgs(ipStr)...).Output()
+ 		if err == nil {
+ 			return parseLinuxRouteMTU(string(out))
+ 		}
+@@ -441,7 +441,7 @@ func discoverPathMTU(endpoint *net.UDPAddr) int {
+ 
+ 	overhead := wireGuardOverhead(endpoint)
+ 
+-	udpConn, err := net.DialUDP("udp", nil, endpoint)
++	udpConn, err := roamDialUDP(endpoint)
+ 	if err != nil {
+ 		appLog.Debug("path MTU discovery: dial failed, using fallback", "endpoint", endpoint.String(), "error", err, "mtu", fallbackMTU)
+ 		return fallbackMTU

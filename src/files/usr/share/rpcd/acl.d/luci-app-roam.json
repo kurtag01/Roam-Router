@@ -51,6 +51,9 @@
    "file": {
     "/etc/roam/*": [
      "read"
+    ],
+    "/tmp/run/teleport.json": [
+     "read"
     ]
    },
    "uci": [
@@ -85,6 +88,9 @@
     ],
     "hostapd.*": [
      "del_client"
+    ],
+    "uci": [
+     "commit"
     ]
    },
    "file": {
@@ -107,6 +113,12 @@
      "exec"
     ],
     "/usr/libexec/roam/update": [
+     "exec"
+    ],
+    "/usr/libexec/roam/teleport": [
+     "exec"
+    ],
+    "/usr/libexec/roam/notify": [
      "exec"
     ]
    },

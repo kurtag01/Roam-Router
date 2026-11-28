@@ -114,5 +114,18 @@
     "luci-app-roam"
    ]
   }
+ },
+ "admin/roam/notify": {
+  "title": "Notifications",
+  "order": 8,
+  "action": {
+   "type": "view",
+   "path": "roam/notify"
+  },
+  "depends": {
+   "acl": [
+    "luci-app-roam"
+   ]
+  }
  }
 }

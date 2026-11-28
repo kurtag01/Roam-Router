@@ -1,0 +1,5 @@
+#!/bin/sh
+# Teleport: put the tunnel routes back once netifd has finished bringing it up.
+case "$ACTION" in ifup|ifupdate) ;; *) exit 0 ;; esac
+[ "$(uci -q get network.$INTERFACE.proto)" = teleport ] || exit 0
+TELEPORT_INTERFACE="$INTERFACE" TELEPORT_IFNAME="$DEVICE" /lib/netifd/teleport-hook routes

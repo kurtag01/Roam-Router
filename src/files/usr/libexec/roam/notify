@@ -1,0 +1,246 @@
+#!/bin/sh
+# Roam notifications: phone push (ntfy) and email (msmtp). Settings: uci roam.notify.
+#
+#   notify event <type> <title> <message> [--priority 1-5] [--tags a,b] [--key K]
+#                [--cooldown S] [--once K]
+#        Queue a notification if notifications and the <type> are turned on, then send it.
+#        Types: device, vpn, login, update, system. --cooldown: skip repeats of the same
+#        key (default: type+title) for S seconds (default 300). --once: send only once
+#        ever for key K (kept in /etc/roam/notify-once).
+#   notify flush             send what is queued (undelivered messages are retried for 24 h)
+#   notify test ntfy|email   send a test now with the saved settings (errors on stderr)
+#   notify log               recent notifications, newest first (JSON lines)
+#   notify topic             a new random ntfy topic name
+#   notify qr                SVG QR code for subscribing to the topic in the ntfy app
+
+. /usr/share/libubox/jshn.sh
+
+D=/tmp/roam-notify
+Q=$D/queue
+LOG=$D/log
+ONCE=/etc/roam/notify-once
+MAX_PER_HOUR=30
+mkdir -p $Q && chmod 700 $D
+
+cfg() { uci -q get "roam.notify.$1"; }
+host() { uci -q get system.@system[0].hostname || echo Roam; }
+
+# One line of printable text: device names from DHCP are untrusted input.
+clean() { printf '%s' "$1" | tr '\r\n\t' '   ' | tr -d '\000-\037\177'; }
+
+log_add() {   # log_add <type> <title> <result>
+	json_init
+	json_add_int time "$(date +%s)"
+	json_add_string type "$1"
+	json_add_string title "$2"
+	json_add_string result "$3"
+	{ json_dump; [ -f $LOG ] && head -n 49 $LOG; } > $LOG.new
+	mv $LOG.new $LOG
+}
+
+# ---- channels -------------------------------------------------------------------
+
+ntfy_send() {   # ntfy_send <title> <message> <priority> <tags>
+	local server topic token tag
+	server=$(cfg ntfy_server); server=${server:-https://ntfy.sh}; server=${server%/}
+	topic=$(cfg ntfy_topic); token=$(cfg ntfy_token)
+	case "$topic" in ''|*[!A-Za-z0-9_-]*) echo "The ntfy topic is missing or has characters other than letters, digits, - and _." >&2; return 2 ;; esac
+	case "$server" in https://*|http://*) ;; *) echo "The ntfy server must start with https://" >&2; return 2 ;; esac
+	json_init
+	json_add_string topic "$topic"
+	json_add_string title "$1"
+	json_add_string message "$2"
+	json_add_int priority "${3:-3}"
+	json_add_array tags
+	for tag in $(echo "$4" | tr ',' ' '); do json_add_string "" "$tag"; done
+	json_close_array
+	local body out
+	body=$(json_dump)
+	# JSON publishing: POST to the server root (UTF-8 titles, no header encoding).
+	if [ -n "$token" ]; then
+		out=$(wget -q -O - -T 20 --header "Authorization: Bearer $token" --post-data "$body" "$server/" 2>&1)
+	else
+		out=$(wget -q -O - -T 20 --post-data "$body" "$server/" 2>&1)
+	fi || { echo "ntfy: could not deliver to $server ($(clean "$out" | cut -c1-120))" >&2; return 1; }
+	return 0
+}
+
+valid_email() { echo "$1" | grep -qE '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'; }
+
+email_send() {   # email_send <title> <message>
+	local hostn port sec user pass from to rcpts r conf=$D/msmtprc pw=$D/smtp-pass
+	[ -x /usr/bin/msmtp ] || { echo "Email is not available (msmtp is not installed)." >&2; return 2; }
+	hostn=$(cfg smtp_host); port=$(cfg smtp_port); sec=$(cfg smtp_security)
+	user=$(cfg smtp_user); pass=$(cfg smtp_pass); from=$(cfg email_from); to=$(cfg email_to)
+	[ -n "$hostn" ] || { echo "Enter the SMTP server." >&2; return 2; }
+	case "$hostn" in *[!A-Za-z0-9.-]*) echo "The SMTP server name is not valid." >&2; return 2 ;; esac
+	sec=${sec:-starttls}
+	case "$port" in ''|*[!0-9]*) case "$sec" in tls) port=465 ;; none) port=25 ;; *) port=587 ;; esac ;; esac
+	from=${from:-$user}
+	valid_email "$from" || { echo "Enter a valid sender address (From)." >&2; return 2; }
+	rcpts=""
+	for r in $(echo "$to" | tr ',;' '  '); do
+		valid_email "$r" || { echo "\"$(clean "$r")\" is not a valid email address." >&2; return 2; }
+		rcpts="$rcpts $r"
+	done
+	[ -n "$rcpts" ] || { echo "Enter at least one recipient (To)." >&2; return 2; }
+
+	umask 077
+	printf '%s' "$pass" > $pw
+	{
+		echo "account roam"
+		echo "host $hostn"
+		echo "port $port"
+		echo "from $from"
+		echo "timeout 25"
+		echo "tls_trust_file /etc/ssl/certs/ca-certificates.crt"
+		case "$sec" in
+			tls)      echo "tls on"; echo "tls_starttls off" ;;
+			starttls) echo "tls on"; echo "tls_starttls on" ;;
+			*)        echo "tls off" ;;
+		esac
+		if [ -n "$user" ]; then
+			echo "auth on"
+			echo "user $(clean "$user")"
+			echo "passwordeval cat $pw"
+		else
+			echo "auth off"
+		fi
+	} > $conf
+
+	local subj out
+	subj=$(clean "[$(host)] $1" | tr -cd ' -~')
+	out=$({
+		echo "From: Roam router <$from>"
+		echo "To: $(echo $rcpts | sed 's/ /, /g')"
+		echo "Subject: $subj"
+		echo "Date: $(date -R)"
+		echo "MIME-Version: 1.0"
+		echo "Content-Type: text/plain; charset=UTF-8"
+		echo "Content-Transfer-Encoding: 8bit"
+		echo
+		printf '%s\n' "$2"
+	} | msmtp -C $conf -a roam -- $rcpts 2>&1)
+	local rc=$?
+	rm -f $pw
+	[ $rc -eq 0 ] || { echo "email: $(clean "$out" | sed 's/msmtp: //g' | cut -c1-200)" >&2; return 1; }
+	return 0
+}
+
+body() {   # message plus a footer naming the router and the time
+	printf '%s\n\n— %s, %s' "$1" "$(host)" "$(date '+%Y-%m-%d %H:%M')"
+}
+
+# ---- queue ----------------------------------------------------------------------
+
+flush() {
+	local m now t ok err
+	now=$(date +%s)
+	# One sender at a time (a lock older than 10 minutes is left over from a crash).
+	if ! mkdir $D/lock 2>/dev/null; then
+		[ $((now - $(date -r $D/lock +%s 2>/dev/null || echo $now))) -gt 600 ] || return 0
+		rm -rf $D/lock; mkdir $D/lock 2>/dev/null || return 0
+	fi
+	trap 'rmdir $D/lock 2>/dev/null' EXIT
+	for m in $(ls $Q 2>/dev/null); do
+		m=$Q/$m
+		[ -f $m/title ] || { rm -rf $m; continue; }
+		t=$(cat $m/time)
+		if [ $((now - t)) -gt 86400 ]; then
+			log_add "$(cat $m/type)" "$(cat $m/title)" "not delivered within 24 hours: $(cat $m/error 2>/dev/null)"
+			rm -rf $m; continue
+		fi
+		ok=1; : > $m/error
+		if [ "$(cfg ntfy_enabled)" = 1 ] && [ ! -f $m/ntfy_done ]; then
+			if err=$(ntfy_send "$(cat $m/title)" "$(cat $m/message)" "$(cat $m/priority)" "$(cat $m/tags)" 2>&1); then
+				touch $m/ntfy_done
+			else ok=0; echo "$err" >> $m/error; fi
+		fi
+		if [ "$(cfg email_enabled)" = 1 ] && [ ! -f $m/email_done ]; then
+			if err=$(email_send "$(cat $m/title)" "$(cat $m/message)" 2>&1); then
+				touch $m/email_done
+			else ok=0; echo "$err" >> $m/error; fi
+		fi
+		if [ $ok = 1 ]; then
+			log_add "$(cat $m/type)" "$(cat $m/title)" "sent"
+			rm -rf $m
+		fi
+	done
+	rmdir $D/lock 2>/dev/null
+	return 0
+}
+
+event() {
+	local type=$1 title msg prio=3 tags="" key="" cooldown=300 once=""
+	[ $# -ge 3 ] || { echo "usage: notify event <type> <title> <message> [options]" >&2; return 1; }
+	title=$(clean "$2"); msg=$3; shift 3
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--priority) prio=$2; shift ;;
+			--tags) tags=$2; shift ;;
+			--key) key=$2; shift ;;
+			--cooldown) cooldown=$2; shift ;;
+			--once) once=$2; shift ;;
+		esac
+		shift
+	done
+	case "$prio" in [1-5]) ;; *) prio=3 ;; esac
+	case "$type" in device|vpn|login|update|system) ;; *) echo "unknown event type: $type" >&2; return 1 ;; esac
+	[ "$(cfg enabled)" = 1 ] || return 0
+	[ "$(cfg ntfy_enabled)" = 1 ] || [ "$(cfg email_enabled)" = 1 ] || return 0
+	[ "$(cfg "ev_$type")" = 0 ] && return 0
+
+	local now stamp f
+	now=$(date +%s)
+	if [ -n "$once" ]; then
+		grep -qxF "$once" $ONCE 2>/dev/null && return 0
+		mkdir -p /etc/roam; echo "$once" >> $ONCE
+	fi
+	# Cooldown per key, and an hourly cap so a flood of events cannot flood your phone.
+	stamp=$D/seen-$(echo "${key:-$type $title}" | md5sum | cut -c1-12)
+	if [ -f $stamp ] && [ $((now - $(cat $stamp))) -lt "$cooldown" ]; then return 0; fi
+	echo $now > $stamp
+	echo $now >> $D/sent-times
+	tail -n 100 $D/sent-times | awk -v n=$now '$1 > n - 3600' > $D/sent-times.new; mv $D/sent-times.new $D/sent-times
+	if [ "$(wc -l < $D/sent-times)" -gt $MAX_PER_HOUR ]; then
+		[ -f $D/capped ] && [ $((now - $(cat $D/capped))) -lt 3600 ] && return 0
+		echo $now > $D/capped
+		type=system; title="Too many notifications"; prio=4; tags=warning
+		msg="More than $MAX_PER_HOUR notifications in the last hour. Further ones are skipped for an hour. Check the router's Notifications page."
+	fi
+
+	f=$Q/$now-$$
+	mkdir -p $f
+	echo "$type" > $f/type; echo "$title" > $f/title; echo "$prio" > $f/priority
+	echo "$tags" > $f/tags; echo "$now" > $f/time
+	body "$msg" > $f/message
+	logger -t roam-notify "$type: $title"
+	# Send in the background: a slow mail server must not hold up whoever reported this.
+	( flush ) </dev/null >/dev/null 2>&1 &
+}
+
+test_send() {
+	local err title="Test notification" msg
+	msg=$(body "Notifications from your Roam router are working.")
+	case "$1" in
+		ntfy)  err=$(ntfy_send "$title" "$msg" 3 "white_check_mark" 2>&1) ;;
+		email) err=$(email_send "$title" "$msg" 2>&1) ;;
+		*) echo "usage: notify test ntfy|email" >&2; return 1 ;;
+	esac
+	if [ $? -eq 0 ]; then log_add system "Test ($1)" "sent"; echo "sent"; return 0; fi
+	log_add system "Test ($1)" "failed: $err"
+	echo "$err" >&2; return 1
+}
+
+case "$1" in
+	event) shift; event "$@" ;;
+	flush) flush ;;
+	test) test_send "$2" ;;
+	log) cat $LOG 2>/dev/null ;;
+	topic) echo "roam-$(head -c 64 /dev/urandom | md5sum | cut -c1-16)" ;;
+	qr)
+		t=$(cfg ntfy_topic); s=$(cfg ntfy_server); s=${s:-https://ntfy.sh}
+		[ -n "$t" ] && command -v qrencode >/dev/null && qrencode -t SVG -m 1 -o - "${s%/}/$t"
+		;;
+	*) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
+esac

@@ -47,9 +47,10 @@ The router uses **192.168.8.x** for its own network, so it doesn't clash with th
 | Internet | **Repeater:** scan and join, hidden networks, disconnect. **MAC address of the repeater radio:** Factory, Random (new address on every start) or Custom, with "copy from device" to get through captive portals. **Ethernet:** use the port as LAN or as Internet (DHCP, static IP or PPPoE). **USB tethering:** status for Android and iPhone. |
 | Wireless | **My Wi-Fi** and **Guest Wi-Fi** (guest is isolated): name, security (WPA2, WPA2/WPA3 or WPA3), password, hidden. **MAC address (BSSID) of each broadcast network:** Factory, Random or Custom. **Radios:** channel and country, which radio broadcasts and which connects to the Internet, and **broadcast power** (High by default, Medium ≈ 14 dBm, Low ≈ 8 dBm; the card shows the power the radio reports). |
 | Clients | Connected devices with name, IP, MAC and signal; block and unblock. |
-| VPN | Add a WireGuard configuration from any provider: drag the `.conf` file onto the WireGuard card or the import window, choose it, paste it, or type the values into a form. Everything is checked before it is saved (an OpenVPN `.ovpn` is recognised and sent to the OpenVPN page). On/off, handshake and traffic. **Kill switch.** OpenVPN is under Advanced. |
+| VPN | Add a WireGuard configuration from any provider: drag the `.conf` file onto the WireGuard card or the import window, choose it, paste it, or type the values into a form. Everything is checked before it is saved (an OpenVPN `.ovpn` is recognised and sent to the OpenVPN page). On/off, handshake and traffic. **UniFi Teleport** (experimental): paste an invite link from your UniFi gateway to use your home connection. **Kill switch.** OpenVPN is under Advanced. |
 | Network | **Encrypted DNS** (DNS-over-HTTPS): off, Cloudflare, Quad9, Mullvad (optionally with ad blocking), AdGuard, Google or a custom server. Also: router LAN address, DHCP range and lease time, plain custom DNS, DNS rebind protection. |
 | System | **Hostname**, time zone, admin password (strong-password rules with an on/off switch, password generator), restart, links to backup, firmware and software. |
+| Notifications | Alerts to your phone (**ntfy** app, scan the QR code) and/or **email** (Gmail, iCloud, Yahoo, Fastmail or any SMTP server), with **Send test** buttons. Choose what to send: new devices, VPN drops, failed sign-ins, updates, restarts. See [Notifications](#notifications). |
 | Updates | Current Roam and OpenWrt version, **Check for updates**, **Install update** with progress, daily automatic check (on by default). The Dashboard shows when an update is available. See [Updates](#updates). |
 | Advanced Settings | All of standard OpenWrt LuCI: firewall, routing, VLANs, packages, logs, SSH and so on. |
 
@@ -92,7 +93,7 @@ Network › Encrypted DNS sends every DNS lookup, from the router and from your 
 
 ## VPN kill switch
 
-VPN › Kill switch makes sure your devices (main and guest Wi-Fi, LAN) can reach the Internet **only through the WireGuard tunnel**. If the tunnel drops or hasn't connected yet, their traffic and DNS lookups are blocked instead of going out over the hotel or home network.
+VPN › Kill switch makes sure your devices (main and guest Wi-Fi, LAN) can reach the Internet **only through the VPN tunnel** (WireGuard or UniFi Teleport). If the tunnel drops or hasn't connected yet, their traffic and DNS lookups are blocked instead of going out over the hotel or home network.
 
 `/usr/libexec/roam/killswitch on|off|status` implements it:
 - **Firewall:** the tunnel gets its own firewall zone, and LAN and guest may only forward to that zone. Their forwardings to `wan` are disabled.
@@ -110,6 +111,82 @@ Turning the VPN off or removing it also turns the kill switch off, because other
 | Kill switch on, tunnel down | Traffic and DNS blocked |
 | Kill switch off, tunnel down | Traffic leaks out unprotected (what the kill switch prevents) |
 | VPN removed | Everything restored |
+
+The kill switch covers UniFi Teleport the same way.
+
+## UniFi Teleport (experimental)
+
+VPN › UniFi Teleport connects the router to your home UniFi gateway, so everything on Roam's Wi-Fi uses your home Internet connection and can reach your home network.
+
+**To set it up:**
+1. In UniFi Network, open Settings › VPN › Teleport, turn Teleport on and create an invitation.
+2. Paste the `https://teleport.ui.link/…` link into Roam.
+3. Roam appears in UniFi as **Roam travel router**. You can change the name before connecting.
+
+**How it works:**
+- **Invitations work once and expire after 24 hours.** After pairing, Roam saves a session in `/etc/teleport/` and deletes the invite. The session is kept across updates, and later connections use it.
+- **Getting through hotel networks.** Teleport finds a path through NAT, like UniFi's own app. A failed invite is not retried; Roam waits for a new one. Other failures retry with growing pauses, so a broken setup never floods Ubiquiti's servers.
+- **Recovery after an outage.** If the tunnel stops answering, Roam first tries the known paths, then negotiates a fresh connection.
+- **IPv4 only.** Internet IPv6 is blocked while Teleport is on, so nothing goes around the tunnel.
+
+**The software:**
+- It's built on [teleport-client](https://github.com/sinnet3000/teleport-client) (MIT, licence in `/usr/share/licenses/teleport-client/`), an independent implementation that Ubiquiti doesn't support.
+- Roam adds a kernel network interface so the whole LAN can use the tunnel, marked sockets so the client's own traffic bypasses it, status reporting and netifd integration. These changes are in `src/teleport/roam-tun.patch`.
+- `src/teleport/build.sh` builds it with a pinned, checksum-verified Go (see `versions.env`).
+- Ubiquiti may change Teleport at any time, which is why the feature is marked experimental.
+
+**Tested** in the VM against a UniFi Dream Machine Pro Max, with a test "laptop" on the LAN:
+
+| Situation | Result |
+|---|---|
+| Pairing with a fresh invite | Paired; session saved; invite removed |
+| Restart | Reconnects from the saved session, no new invite |
+| LAN laptop | Public IP is the home connection; home network reachable; 5 MB download in 2 s |
+| Kill switch on, tunnel frozen or down | Traffic blocked |
+| Kill switch on, tunnel restarted | Connects through the bootstrap DNS server; laptop back online |
+| Uplink blocked for 45 s | Renegotiated on its own; laptop back online about 80 s after the uplink returned |
+| Invalid or used invite | Clear error in the UI; no retries |
+
+## Notifications
+
+The Notifications page sends alerts to your phone and/or by email.
+
+**Phone (ntfy):** install the free ntfy app and subscribe to the topic shown on the page, or scan its QR code.
+- The page generates a random topic name.
+- Anyone who knows the name can read its messages, so keep it private, or use your own ntfy server with an access token.
+- Messages go out over HTTPS with the router's built-in `wget`.
+
+**Email:** sent with `msmtp` over SSL/TLS or STARTTLS, and certificates are checked.
+- Presets for Gmail, iCloud, Yahoo and Fastmail. These need an *app password*, not your normal password.
+- **Other** takes any SMTP server.
+
+**Events,** each with its own switch:
+
+| Event | Sent when |
+|---|---|
+| New devices | A device gets an address on the main or guest network for the first time. Devices already there when notifications start are not reported. |
+| VPN | The active VPN (WireGuard or Teleport) stays down for more than a minute, and again when it reconnects. The message says whether the kill switch is keeping your devices offline. |
+| Failed sign-ins | A wrong password on the web page or over SSH, with the source address. |
+| Updates | A new Roam version is available (once per version), or the router was updated. |
+| Router restarts | The router started, for example after a power cut. |
+
+**How it behaves:**
+- **Retries:** a message that can't be sent right away (no Internet, kill switch, hotel sign-in page) is queued and retried for 24 hours.
+- **Limits:** repeats are held back (one message per device, one per sign-in source every 15 minutes, a 10-minute cooldown for VPN drops), and there are at most 30 messages an hour.
+- **Untrusted input:** device names reported over DHCP are cleaned before use, and ntfy messages are built as JSON. Email recipients are checked, and line breaks in titles are removed, so nothing can be injected.
+- **History:** the page shows the last messages and whether they were delivered.
+
+**Under the hood:**
+- `/usr/libexec/roam/notify` (`event`, `test`, `flush`, `log`) sends the messages.
+- The `roam-notify` service (`/usr/libexec/roam/notifyd`) watches the system log and checks the VPN and new devices every 30 seconds.
+- The list of known devices (`/etc/roam/known-devices`) is kept across updates.
+- Settings are in `uci show roam.notify`. The email password is kept there too, readable only by root.
+
+**Tested** in the VM:
+- **ntfy:** test, new device, failed sign-ins and VPN lost/reconnected all received from ntfy.sh.
+- **Repeats:** two web plus one SSH failures from one address gave one message.
+- **Untrusted names:** a hostile DHCP hostname arrived as plain text.
+- **Email:** delivered to two recipients through a test SMTP server. A title with an injected `Bcc:` stayed in the Subject, and wrong addresses or an unreachable server gave clear errors.
 
 ## Privacy on upstream networks
 

@@ -1,0 +1,18 @@
+#!/bin/sh /etc/rc.common
+# Roam notifications: event watchers (see /usr/libexec/roam/notifyd). Sending is off until
+# it is set up on the Notifications page (uci roam.notify).
+
+START=99
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance log
+	procd_set_param command /usr/libexec/roam/notifyd log
+	procd_set_param respawn 3600 10 0
+	procd_close_instance
+
+	procd_open_instance poll
+	procd_set_param command /usr/libexec/roam/notifyd poll
+	procd_set_param respawn 3600 10 0
+	procd_close_instance
+}

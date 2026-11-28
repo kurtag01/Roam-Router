@@ -61,6 +61,9 @@ check() {
 	NEW=false; newer "$LATEST" "$ROAM_VERSION" && NEW=true
 	[ -n "$FILE" ] || { [ "$NEW" = true ] && fail "Release $LATEST has no file for this device ($ROAM_TARGET)."; }
 	NOTES="https://github.com/$REPO/releases/tag/v$LATEST"; [ -n "$BASE" ] && NOTES=""
+	[ "$NEW" = true ] && /usr/libexec/roam/notify event update "Update available" \
+		"Roam $LATEST is available (this router has $ROAM_VERSION). Install it on the router's Updates page." \
+		--priority 2 --tags package --once "available $LATEST" >/dev/null 2>&1
 	printf '{"current":"%s","openwrt_current":"%s","latest":"%s","openwrt_latest":"%s","newer":%s,"target":"%s","file":"%s","notes":"%s","checked":%s}\n' \
 		"$ROAM_VERSION" "$OPENWRT_VERSION" "$LATEST" "$OWRT" "$NEW" "$ROAM_TARGET" "$(json_str "$FILE")" "$NOTES" "$(date +%s)" | tee $D/check.json
 }

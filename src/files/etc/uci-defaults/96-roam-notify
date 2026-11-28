@@ -1,0 +1,13 @@
+#!/bin/sh
+# Notifications: settings section (off until set up on the Notifications page) and the
+# watcher service. Safe to run again: existing settings are kept.
+
+uci -q get roam.notify >/dev/null || {
+	uci set roam.notify=notify
+	uci set roam.notify.enabled='0'
+	uci set roam.notify.ntfy_server='https://ntfy.sh'
+	uci set roam.notify.smtp_security='starttls'
+	uci commit roam
+}
+/etc/init.d/roam-notify enable
+exit 0

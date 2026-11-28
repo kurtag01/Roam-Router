@@ -14,7 +14,7 @@ const callLeases = rpc.declare({ object: 'luci-rpc', method: 'getDHCPLeases', ex
 const callWg = rpc.declare({ object: 'luci.wireguard', method: 'getWgInstances', expect: { '': {} } });
 
 const UPLINKS = {
-	wan: 'Ethernet', wwan: 'Repeater', tether: 'USB tethering', tether_ios: 'iPhone tethering', wgclient: 'WireGuard VPN'
+	wan: 'Ethernet', wwan: 'Repeater', tether: 'USB tethering', tether_ios: 'iPhone tethering', wgclient: 'WireGuard VPN', teleport: 'UniFi Teleport'
 };
 
 return view.extend({
@@ -27,7 +27,8 @@ return view.extend({
 			L.resolveDefault(callBoard(), {}),
 			L.resolveDefault(callLeases(), {}),
 			uci.load([ 'wireless', 'system', 'network', 'roam' ]),
-			L.resolveDefault(callWg(), {})
+			L.resolveDefault(callWg(), {}),
+			L.resolveDefault(fs.read('/tmp/run/teleport.json'), '').then((t) => { try { return JSON.parse(t) || {}; } catch (e) { return {}; } })
 		]).then((r) => {
 			const wifis = r[1];
 			return Promise.all(wifis.map((w) => L.resolveDefault(w.getAssocList(), []))).then((assoc) => {
@@ -38,12 +39,12 @@ return view.extend({
 	},
 
 	renderCards(data) {
-		const nets = data[0], wifis = data[1], wans = data[2], info = data[3], board = data[4], leases = data[5], wgi = data[7] || {}, assoc = data[8];
+		const nets = data[0], wifis = data[1], wans = data[2], info = data[3], board = data[4], leases = data[5], wgi = data[7] || {}, tps = data[8] || {}, assoc = data[9];
 		const byName = {};
 		nets.forEach((n) => byName[n.getName()] = n);
 
 		/* ---- Internet ---- */
-		const wan = wans.filter((n) => n.getName() != 'wgclient')[0] || wans[0];
+		const wan = wans.filter((n) => n.getName() != 'wgclient' && n.getName() != 'teleport')[0] || wans[0];
 		let inet;
 		if (wan) {
 			const name = wan.getName();
@@ -96,12 +97,22 @@ return view.extend({
 		const wgOn = wg && uci.get('network', 'wgclient', 'disabled') != '1';
 		const peer = Object.values((wgi.wgclient || {}).peers || {})[0] || {};
 		const hs = +peer.latest_handshake || 0;
-		const wgLive = wgOn && wg.isUp() && hs && (Date.now() / 1000 - hs) < 180;
+		let wgLive = wgOn && wg.isUp() && hs && (Date.now() / 1000 - hs) < 180;
+		let vpnText = !wg ? 'Import a WireGuard configuration from your VPN provider to route all traffic through it.'
+			: (wgLive ? 'All traffic leaves through the WireGuard tunnel.' : (wgOn ? 'Waiting for the VPN server to answer.' : 'The WireGuard tunnel is off.'));
+		let vpnOn = wgOn, vpnSet = !!wg;
+		/* UniFi Teleport (experimental), when it is the VPN in use */
+		const tp = byName.teleport;
+		if (tp && uci.get('network', 'teleport', 'disabled') != '1') {
+			vpnOn = vpnSet = true;
+			wgLive = tp.isUp() && tps.state == 'connected';
+			vpnText = wgLive ? 'All traffic goes through your home UniFi gateway' + (tps.console ? ' (' + tps.console + ')' : '') + ' with UniFi Teleport.'
+				: 'UniFi Teleport is connecting to your home gateway.';
+		} else if (tp && !wgOn) vpnSet = true;
 		const vpnCard = rc.card({ icon: 'shield', title: 'VPN', off: !wgLive,
-			pill: !wg ? 'Not set up' : (wgLive ? 'Protected' : (wgOn ? 'Connecting' : 'Off')),
-			pillClass: !wg ? '' : (wgLive ? 'ok' : (wgOn ? 'warn' : '')), body: [
-				E('p', { 'class': 'roam-muted' }, [ !wg ? 'Import a WireGuard configuration from your VPN provider to route all traffic through it.'
-					: (wgLive ? 'All traffic leaves through the WireGuard tunnel.' : (wgOn ? 'Waiting for the VPN server to answer.' : 'The WireGuard tunnel is off.')) ]),
+			pill: !vpnSet ? 'Not set up' : (wgLive ? 'Protected' : (vpnOn ? 'Connecting' : 'Off')),
+			pillClass: !vpnSet ? '' : (wgLive ? 'ok' : (vpnOn ? 'warn' : '')), body: [
+				E('p', { 'class': 'roam-muted' }, [ (tp && !vpnOn) ? 'The VPN is off.' : vpnText ]),
 				uci.get('roam', 'main', 'killswitch') == '1' ? E('p', { 'class': 'roam-small' }, [ E('span', { 'class': 'roam-pill ' + (wgLive ? 'ok' : 'warn') }, [ wgLive ? 'Kill switch on' : 'Kill switch on \u2013 devices offline until VPN connects' ]) ]) : ''
 			], actions: [ E('a', { 'class': 'btn cbi-button', 'href': L.url('admin/roam/vpn') }, [ 'Manage' ]) ] });
 

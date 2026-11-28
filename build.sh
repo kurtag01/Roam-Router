@@ -151,13 +151,15 @@ PKGS=(
   luci-app-openvpn openvpn-mbedtls
   # Encrypted DNS (DNS-over-HTTPS):
   https-dns-proxy luci-app-https-dns-proxy
+  # Notifications by email (phone push uses the built-in wget):
+  msmtp
 )
 [[ $MODE == x86test ]] && PKGS+=(kmod-mac80211-hwsim ip-full kmod-veth)
 # Container: the host's kernel and drivers are used, so no kernel modules/firmware/USB tools.
 if (( CONTAINER )); then
   PKGS=(luci luci-ssl -wpad-basic-mbedtls wpad-mbedtls wifi-scripts iwinfo iw
         luci-proto-wireguard wireguard-tools qrencode luci-app-openvpn openvpn-mbedtls
-        https-dns-proxy luci-app-https-dns-proxy)
+        https-dns-proxy luci-app-https-dns-proxy msmtp)
 fi
 
 IBNAME="openwrt-imagebuilder-$VER-$TGTN.Linux-x86_64"
@@ -196,6 +198,10 @@ case "$MODE" in rpi4) T=rpi4 ;; x86test) T=x86test ;; *) T=container ;; esac
 release_info "$T" > "$STAGE/etc/roam-release"
 mkdir -p "$STAGE/etc/roam"
 if [[ -f $PUBKEY ]]; then cp "$PUBKEY" "$STAGE/etc/roam/release.pub"; else rm -f "$STAGE/etc/roam/release.pub"; fi
+# UniFi Teleport client (experimental VPN option), built from pinned source.
+case "$MODE" in rpi4|ct-arm64) GOARCH_=arm64 ;; *) GOARCH_=amd64 ;; esac
+"$HERE/src/teleport/build.sh" "$GOARCH_" "$STAGE"
+chmod 0755 "$STAGE/lib/netifd/proto/teleport.sh" "$STAGE/lib/netifd/teleport-hook"
 
 mkdir -p "$IB/tmp"
 make -C "$IB" image PROFILE="$PROFILE" PACKAGES="${PKGS[*]}" FILES="$STAGE" \
